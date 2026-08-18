@@ -7,6 +7,7 @@ from multiprocessing.shared_memory import SharedMemory
 from zvllm.config import Config
 from zvllm.engine.sequence import Sequence
 from zvllm.models.qwen3 import Qwen3ForCausalLM
+from zvllm.models.qwen3_moe import Qwen3MoeForCausalLM
 from zvllm.layers.sampler import Sampler
 from zvllm.utils.context import set_context, get_context, reset_context
 from zvllm.utils.loader import load_model
@@ -28,7 +29,21 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+        self.moe_tp_group = None
+        if getattr(hf_config, "model_type", "") == "qwen3_moe":
+            # 所有 rank 必须同序创建子组；返回非 None 的只有本 rank 所属的组
+            for g in range(config.moe_ep_size):
+                group = dist.new_group(ranks=list(range(g * config.moe_tp_size, (g + 1) * config.moe_tp_size)))
+                if group is not None:
+                    self.moe_tp_group = group
+            self.model = Qwen3MoeForCausalLM(hf_config, config.moe_tp_size, config.moe_ep_size, self.moe_tp_group)
+            if not self.enforce_eager:
+                # top-k 路由使每专家 GEMM 形状动态，与 CUDA Graph 固定形状捕获不兼容
+                self.enforce_eager = True
+                if self.rank == 0:
+                    print("[Z-vLLM] 检测到 MoE 模型，自动切换到 enforce_eager=True（CUDA Graph 暂不支持）")
+        else:
+            self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
@@ -107,7 +122,12 @@ class ModelRunner:
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        num_kv_heads = hf_config.num_key_value_heads
+        if num_kv_heads % self.world_size == 0:
+            num_kv_heads //= self.world_size
+        else:
+            assert self.world_size % num_kv_heads == 0
+            num_kv_heads = 1    # TP 超过 KV head 数：复制 KV head
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes

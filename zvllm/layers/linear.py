@@ -17,11 +17,14 @@ class LinearBase(nn.Module):
         output_size: int,
         bias: bool = False,
         tp_dim: int | None = None,
+        tp_group: "dist.ProcessGroup | None" = None,
     ):
         super().__init__()
         self.tp_dim = tp_dim
-        self.tp_rank = dist.get_rank()
-        self.tp_size = dist.get_world_size()
+        # tp_group 为 None 表示全局 TP 组（attention 等）；MoE 专家传入专家内 TP 子组
+        self.tp_group = tp_group
+        self.tp_rank = dist.get_rank(tp_group)
+        self.tp_size = dist.get_world_size(tp_group)
         self.weight = nn.Parameter(torch.empty(output_size, input_size))
         self.weight.weight_loader = self.weight_loader
         if bias:
@@ -58,9 +61,9 @@ class ColumnParallelLinear(LinearBase):
         input_size: int,
         output_size: int,
         bias: bool = False,
+        tp_group: "dist.ProcessGroup | None" = None,
     ):
-        tp_size = dist.get_world_size()
-        super().__init__(input_size, divide(output_size, tp_size), bias, 0)
+        super().__init__(input_size, divide(output_size, dist.get_world_size(tp_group)), bias, 0, tp_group)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
@@ -80,9 +83,10 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         input_size: int,
         output_sizes: list[int],
         bias: bool = False,
+        tp_group: "dist.ProcessGroup | None" = None,
     ):
         self.output_sizes = output_sizes
-        super().__init__(input_size, sum(output_sizes), bias)
+        super().__init__(input_size, sum(output_sizes), bias, tp_group)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int):
         param_data = param.data
@@ -102,14 +106,25 @@ class QKVParallelLinear(ColumnParallelLinear):
         total_num_heads: int,
         total_num_kv_heads: int | None = None,
         bias: bool = False,
+        tp_group: "dist.ProcessGroup | None" = None,
     ):
-        tp_size = dist.get_world_size()
+        tp_size = dist.get_world_size(tp_group)
         total_num_kv_heads = total_num_kv_heads or total_num_heads
+        self.total_num_kv_heads = total_num_kv_heads
         self.head_size = head_size
         self.num_heads = divide(total_num_heads, tp_size)
-        self.num_kv_heads = divide(total_num_kv_heads, tp_size)
+        if total_num_kv_heads % tp_size == 0:
+            self.num_kv_heads = total_num_kv_heads // tp_size
+        else:
+            # TP 超过 KV head 数时（如 8 卡跑 4 KV head 的模型）：复制 KV head，每 rank 持有一个
+            assert tp_size % total_num_kv_heads == 0
+            self.num_kv_heads = 1
         output_size = (total_num_heads + 2 * total_num_kv_heads) * self.head_size
-        super().__init__(hidden_size, output_size, bias)
+        if self.num_kv_heads * tp_size == total_num_kv_heads:
+            super().__init__(hidden_size, output_size, bias, tp_group)
+        else:
+            # 复制模式下每 rank 宽度 != 总量/tp，直接按每 rank head 数初始化
+            LinearBase.__init__(self, hidden_size, (self.num_heads + 2 * self.num_kv_heads) * self.head_size, bias, 0, tp_group)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str):
         param_data = param.data
@@ -117,14 +132,15 @@ class QKVParallelLinear(ColumnParallelLinear):
         if loaded_shard_id == "q":
             shard_size = self.num_heads * self.head_size
             shard_offset = 0
-        elif loaded_shard_id == "k":
-            shard_size = self.num_kv_heads * self.head_size
-            shard_offset = self.num_heads * self.head_size
         else:
             shard_size = self.num_kv_heads * self.head_size
-            shard_offset = self.num_heads * self.head_size + self.num_kv_heads * self.head_size
+            shard_offset = self.num_heads * self.head_size + (0 if loaded_shard_id == "k" else self.num_kv_heads * self.head_size)
         param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
-        loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
+        if loaded_shard_id == "q" or self.num_kv_heads * self.tp_size == self.total_num_kv_heads:
+            loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
+        else:
+            # KV head 复制：rank r 取 head 组 r % total_num_kv_heads
+            loaded_weight = loaded_weight.chunk(self.total_num_kv_heads, self.tp_dim)[self.tp_rank % self.total_num_kv_heads]
         param_data.copy_(loaded_weight)
 
 
@@ -135,9 +151,9 @@ class RowParallelLinear(LinearBase):
         input_size: int,
         output_size: int,
         bias: bool = False,
+        tp_group: "dist.ProcessGroup | None" = None,
     ):
-        tp_size = dist.get_world_size()
-        super().__init__(divide(input_size, tp_size), output_size, bias, 1)
+        super().__init__(divide(input_size, dist.get_world_size(tp_group)), output_size, bias, 1, tp_group)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
@@ -152,5 +168,5 @@ class RowParallelLinear(LinearBase):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1:
-            dist.all_reduce(y)
+            dist.all_reduce(y, group=self.tp_group)
         return y
