@@ -17,6 +17,10 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    master_port: int = 2333              # NCCL 进程组初始化端口
+    shm_name: str = "zvllm"              # 多卡方法调用的共享内存名
+    shm_size: int = 2**20                # 共享内存大小（字节）
+    max_graph_bs: int = 512              # CUDA Graph 捕获的最大 batch size
 
     def __post_init__(self):
         from transformers import AutoConfig
