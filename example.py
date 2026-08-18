@@ -1,5 +1,5 @@
 import os
-from nanovllm import LLM, SamplingParams
+from zvllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 
 

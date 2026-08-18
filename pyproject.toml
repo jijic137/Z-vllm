@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "nano-vllm"
+name = "z-vllm"
 version = "0.2.0"
 authors = [{ name = "jijic137" }]
 license = "MIT"
@@ -20,8 +20,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage="https://github.com/jijic137/nano-vllm"
+Homepage="https://github.com/jijic137/Z-vllm"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["nanovllm*"]
+include = ["zvllm*"]

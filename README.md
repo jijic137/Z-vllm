@@ -2,7 +2,7 @@
 <img width="300" src="assets/logo.png">
 </p>
 
-# Nano-vLLM
+# Z-vLLM
 
 从零实现的轻量级 LLM 推理引擎，个人二次开发项目。
 
@@ -27,7 +27,7 @@
 ├── example.py                # 快速上手示例
 ├── bench.py                  # 吞吐基准测试脚本
 ├── assets/logo.png
-└── nanovllm/
+└── zvllm/
     ├── __init__.py           # 对外 API：LLM、SamplingParams
     ├── llm.py                # LLM 入口（即 LLMEngine）
     ├── sampling_params.py    # 采样参数
@@ -62,8 +62,8 @@
 * [flash-attn](https://github.com/Dao-AILab/flash-attention)（可能需按官方指引编译安装）
 
 ```bash
-git clone https://github.com/jijic137/nano-vllm.git
-cd nano-vllm
+git clone https://github.com/jijic137/Z-vllm.git
+cd Z-vllm
 pip install -e .
 ```
 
@@ -83,11 +83,11 @@ huggingface-cli download --resume-download Qwen/Qwen3-0.6B \
 完整示例见 `example.py`。API 风格对齐 vLLM：
 
 ```python
-from nanovllm import LLM, SamplingParams
+from zvllm import LLM, SamplingParams
 
 llm = LLM("/YOUR/MODEL/PATH", enforce_eager=True, tensor_parallel_size=1)
 sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
-outputs = llm.generate(["Hello, Nano-vLLM."], sampling_params)
+outputs = llm.generate(["Hello, Z-vLLM."], sampling_params)
 print(outputs[0]["text"])
 ```
 
@@ -126,7 +126,7 @@ print(outputs[0]["text"])
 | 推理引擎 | 输出 token 数 | 耗时 (s) | 吞吐 (tokens/s) |
 |---|---|---|---|
 | vLLM | 133,966 | 98.37 | 1361.84 |
-| Nano-vLLM | 133,966 | 93.41 | 1434.13 |
+| Z-vLLM | 133,966 | 93.41 | 1434.13 |
 
 ## Roadmap
 
