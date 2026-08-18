@@ -160,7 +160,11 @@ class ModelRunner:
             seqlen_q = seq.num_scheduled_tokens
             end = start + seqlen_q
             seqlen_k = end
-            input_ids.extend(seq[start:end])
+            if seq.is_prefill:
+                input_ids.extend(seq[start:end])
+            else:    # 混合步中的 decode 序列：TP worker 反序列化后只剩 last_token
+                assert seqlen_q == 1
+                input_ids.append(seq.last_token)
             positions.extend(range(start, end))
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
