@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "nano-vllm"
 version = "0.2.0"
-authors = [{ name = "Xingkai Yu" }]
+authors = [{ name = "jijic137" }]
 license = "MIT"
 license-files = ["LICENSE"]
 readme = "README.md"
@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage="https://github.com/GeeeekExplorer/nano-vllm"
+Homepage="https://github.com/jijic137/nano-vllm"
 
 [tool.setuptools.packages.find]
 where = ["."]
