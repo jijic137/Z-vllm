@@ -101,11 +101,20 @@ class BlockManager:
         seq.block_table.clear()
 
     def can_append(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
+        return len(self.free_block_ids) >= self._block_needed(seq)
 
     def may_append(self, seq: Sequence):
-        if len(seq) % self.block_size == 1:
+        if self._block_needed(seq):
             seq.block_table.append(self._allocate_block())
+
+    def _block_needed(self, seq: Sequence) -> int:
+        """当前最后一个 token（位置 len-1）所在块尚未分配，需要扩容。
+
+        旧条件 len(seq) % block_size == 1 对 prompt 长度 % block_size == 1 的序列
+        会多分配一块（prefill 时该块已分配），使 decode 槽位公式 table[-1] 指向错误块。
+        上游 nano-vllm issue #240 / #66。
+        """
+        return 1 if (len(seq) - 1) // self.block_size >= len(seq.block_table) else 0
 
     def hash_blocks(self, seq: Sequence):
         start = seq.num_cached_tokens // self.block_size
