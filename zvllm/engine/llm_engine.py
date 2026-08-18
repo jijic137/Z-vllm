@@ -58,16 +58,23 @@ class LLMEngine:
         """执行一步调度 + 推理。
 
         返回 (outputs, num_tokens)：
-        - outputs：本步批内每条被调度序列的 (seq_id, new_token_ids, finished)；
+        - outputs：本步批内每条被调度序列的 (seq_id, new_token_ids, finished, finish_reason)；
           new_token_ids 为该序列本步新生成的 token（目前恒为 1 个），
-          finished 表示该序列本步结束后是否终止（eos / max_tokens）。
+          finished 表示该序列本步结束后是否终止（eos / max_tokens），
+          finish_reason 为 OpenAI 语义的结束原因（"stop" / "length"），未结束时为 None。
         - num_tokens：本步处理的 token 数（prefill/混合步为正、纯 decode 步为负），用于吞吐展示。
         """
         seqs, is_prefill = self.scheduler.schedule()
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
-        outputs = [(seq.seq_id, [token_id], seq.is_finished) for seq, token_id in zip(seqs, token_ids)]
+        outputs = []
+        for seq, token_id in zip(seqs, token_ids):
+            if seq.is_finished:
+                reason = "length" if seq.num_completion_tokens >= seq.max_tokens else "stop"
+            else:
+                reason = None
+            outputs.append((seq.seq_id, [token_id], seq.is_finished, reason))
         return outputs, num_tokens
 
     def is_finished(self):
@@ -110,7 +117,7 @@ class LLMEngine:
                 "Prefill": f"{int(prefill_throughput)}tok/s",
                 "Decode": f"{int(decode_throughput)}tok/s",
             })
-            for seq_id, new_token_ids, finished in outputs:
+            for seq_id, new_token_ids, finished, _reason in outputs:
                 completion_ids[seq_id] = completion_ids.get(seq_id, []) + new_token_ids
                 if finished:
                     pbar.update(1)
@@ -131,6 +138,7 @@ class LLMEngine:
         - text：到目前为止的完整补全文本
         - token_ids：到目前为止的完整补全 token 列表
         - finished：该请求是否结束（每个请求的最后一个事件为 True）
+        - finish_reason：OpenAI 语义的结束原因（"stop" / "length"），未结束时为 None
 
         注意：生成器未消费完就放弃（break / 异常）时，未完成请求仍驻留在引擎内，
         该引擎不适合再混入其他请求（本版本不提供逐请求取消）。
@@ -141,7 +149,7 @@ class LLMEngine:
         pending = len(seqs)
         while pending:
             outputs, _ = self.step()
-            for seq_id, new_token_ids, finished in outputs:
+            for seq_id, new_token_ids, finished, reason in outputs:
                 token_ids = completion_ids.get(seq_id, []) + new_token_ids
                 completion_ids[seq_id] = token_ids
                 if finished:
@@ -152,5 +160,6 @@ class LLMEngine:
                     "text": self.tokenizer.decode(token_ids),
                     "token_ids": token_ids,
                     "finished": finished,
+                    "finish_reason": reason,
                 }
         completion_ids.clear()

@@ -54,19 +54,19 @@ def make_engine(script):
 def test_generate_stream_events():
     # 两条请求各出 2 token，第二步同时结束；事件按 (步内批序) 产出
     engine = make_engine([
-        [(0, [10], False), (1, [20], False)],
-        [(0, [11], True), (1, [21], True)],
+        [(0, [10], False, None), (1, [20], False, None)],
+        [(0, [11], True, "stop"), (1, [21], True, "length")],
     ])
     events = list(LLMEngine.generate_stream(engine, ["p0", "p1"], "sp"))
     assert len(events) == 4
     assert events[0] == {"index": 0, "delta": "<10>", "text": "<10>",
-                         "token_ids": [10], "finished": False}
+                         "token_ids": [10], "finished": False, "finish_reason": None}
     assert events[1] == {"index": 1, "delta": "<20>", "text": "<20>",
-                         "token_ids": [20], "finished": False}
+                         "token_ids": [20], "finished": False, "finish_reason": None}
     assert events[2] == {"index": 0, "delta": "<11>", "text": "<10><11>",
-                         "token_ids": [10, 11], "finished": True}
+                         "token_ids": [10, 11], "finished": True, "finish_reason": "stop"}
     assert events[3] == {"index": 1, "delta": "<21>", "text": "<20><21>",
-                         "token_ids": [20, 21], "finished": True}
+                         "token_ids": [20, 21], "finished": True, "finish_reason": "length"}
     # 每条请求的最后一个事件必须是 finished=True
     last_finished = {}
     for e in events:
@@ -78,12 +78,13 @@ def test_generate_stream_events():
 def test_stream_finish_order_independent():
     # 请求 1 先结束、请求 0 继续生成：结束计数与文本累积不受结束顺序影响
     engine = make_engine([
-        [(0, [10], False), (1, [20], True)],
-        [(0, [11], True)],
+        [(0, [10], False, None), (1, [20], True, "stop")],
+        [(0, [11], True, "stop")],
     ])
     events = list(LLMEngine.generate_stream(engine, ["p0", "p1"], "sp"))
     assert [e["index"] for e in events] == [0, 1, 0]
     assert events[1]["finished"] is True and events[1]["text"] == "<20>"
+    assert events[1]["finish_reason"] == "stop"
     assert events[2]["text"] == "<10><11>" and events[2]["finished"] is True
     print("test_stream_finish_order_independent OK")
 
@@ -91,8 +92,8 @@ def test_stream_finish_order_independent():
 def test_generate_blocking_aggregation():
     # 非流式：跨步累积 token，按输入顺序返回完整结果
     engine = make_engine([
-        [(0, [10], False), (1, [20], False)],
-        [(0, [11], True), (1, [21], True)],
+        [(0, [10], False, None), (1, [20], False, None)],
+        [(0, [11], True, "stop"), (1, [21], True, "stop")],
     ])
     results = LLMEngine.generate(engine, ["p0", "p1"], "sp", use_tqdm=False)
     assert results == [
@@ -105,7 +106,7 @@ def test_generate_blocking_aggregation():
 def test_generate_stream_dispatch():
     # generate(stream=True) 返回生成器且不阻塞执行
     import types
-    engine = make_engine([[(0, [10], True)]])
+    engine = make_engine([[(0, [10], True, "stop")]])
     engine.generate_stream = types.MethodType(LLMEngine.generate_stream, engine)
     gen = LLMEngine.generate(engine, ["p0"], "sp", stream=True)
     assert isinstance(gen, types.GeneratorType)

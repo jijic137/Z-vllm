@@ -19,6 +19,9 @@ dependencies = [
     "xxhash",
 ]
 
+[project.optional-dependencies]
+serve = ["fastapi>=0.110", "uvicorn>=0.29"]
+
 [project.urls]
 Homepage="https://github.com/jijic137/Z-vllm"
 
