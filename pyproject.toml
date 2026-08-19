@@ -15,11 +15,15 @@ dependencies = [
     "torch>=2.4.0",
     "triton>=3.0.0",
     "transformers>=4.57.0",
-    "flash-attn",
     "xxhash",
 ]
 
 [project.optional-dependencies]
+# flash-attn：可选加速后端。CUDA 环境可直接安装；ROCm 需自行编译（可选）。
+# 缺失时 attention 自动退回 SDPA 兜底后端，decode 自动切换 enforce_eager
+flash = ["flash-attn"]
+# modelscope：模型权重来源。非本地模型 ID 且未指定 model_source="hf" 时会优先尝试魔搭下载
+modelscope = ["modelscope"]
 serve = ["fastapi>=0.110", "uvicorn>=0.29"]
 
 [project.urls]

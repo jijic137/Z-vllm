@@ -5,6 +5,7 @@ from dataclasses import dataclass
 @dataclass(slots=True)
 class Config:
     model: str
+    model_source: str = "auto"    # model 非本地路径时的权重来源：auto / modelscope / hf
     max_num_batched_tokens: int = 16384
     max_num_seqs: int = 512
     max_model_len: int = 4096
@@ -24,7 +25,12 @@ class Config:
 
     def __post_init__(self):
         from transformers import AutoConfig
+        from zvllm.utils.model_download import resolve_model_path
 
+        assert self.model_source in ("auto", "modelscope", "hf"), \
+            f"model_source 必须是 auto / modelscope / hf（当前 {self.model_source}）"
+        # 主进程解析/下载一次，多卡 worker 经 pickle 拿到的是已就绪的本地路径
+        self.model = resolve_model_path(self.model, self.model_source)
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8

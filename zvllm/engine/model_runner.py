@@ -5,6 +5,7 @@ from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
 from zvllm.config import Config
+from zvllm.layers.attention import HAS_FLASH_ATTN
 from zvllm.engine.sequence import Sequence
 from zvllm.models.qwen3 import Qwen3ForCausalLM
 from zvllm.models.qwen3_moe import Qwen3MoeForCausalLM
@@ -23,6 +24,11 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        if not HAS_FLASH_ATTN and not self.enforce_eager:
+            # SDPA 兜底的 decode 需要 context_lens.max() host 同步，与 CUDA Graph 捕获不兼容
+            self.enforce_eager = True
+            if self.rank == 0:
+                print("[Z-vLLM] flash_attn 不可用：attention 使用 SDPA 兜底后端，decode 切换为 enforce_eager=True")
 
         dist.init_process_group("nccl", f"tcp://localhost:{config.master_port}", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
