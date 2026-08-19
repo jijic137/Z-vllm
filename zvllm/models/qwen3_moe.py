@@ -118,8 +118,9 @@ class Qwen3MoeDecoderLayer(nn.Module):
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
         )
-        if layer_id < getattr(config, "first_k_dense_replace", 1):
-            # 前几层是 dense MLP（Qwen3-30B-A3B: first_k_dense_replace=1）
+        if layer_id < getattr(config, "first_k_dense_replace", 0):
+            # 前 first_k_dense_replace 层是 dense MLP（HF Qwen3MoeConfig 缺省为 0，
+            # 如 Qwen3-30B-A3B 全 48 层 MoE；235B 等在 config.json 中显式置 1）
             self.mlp = Qwen3MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
