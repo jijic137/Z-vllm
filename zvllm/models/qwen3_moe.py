@@ -76,25 +76,21 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         # router 全量复制在每个 rank：输入跨 rank 一致，top-k 结果天然一致，无需通信
         self.gate = nn.Linear(config.hidden_size, self.num_experts, bias=False)
         self.local_start = self.local_expert_ids[0]
-        # 融合路径的 stacked 专家权重（惰性构建，见 _fused_weights）
-        self._w13: torch.Tensor | None = None
-        self._w2: torch.Tensor | None = None
-
-    def _fused_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """构建融合路径的 stacked 权重：w13 [E, 2I_local, H]（前 I 行 gate、后 I 行 up）、
-        w2 [E, H, I_local]（30B EP=2 实测 +1.0GB/rank：w13 805MB + w2 197MB）。
-        由 ModelRunner 在 load_model 之后、显存预算（warmup profiling + KV cache 分配）
-        之前预构建一次并缓存：若在首次 decode forward 才构建，KV cache 已按
-        gpu_memory_utilization 占满预算，cat 的额外分配会 OOM（2026-08-19 EP=2 实测）。
-        MoE 恒为 eager（见 model_runner），不会撞 CUDA graph capture。"""
-        if self._w13 is None:
-            w13, w2 = [], []
-            for e in self.local_expert_ids:
-                w13.append(self.experts[str(e)].gate_up_proj.weight.unsqueeze(0))
-                w2.append(self.experts[str(e)].down_proj.weight.unsqueeze(0))
-            self._w13 = torch.cat(w13, dim=0).contiguous()
-            self._w2 = torch.cat(w2, dim=0).contiguous()
-        return self._w13, self._w2
+        # stacked 专家权重：w13 [E, 2I, H]（前 I 行 gate、后 I 行 up），w2 [E, H, I]。
+        # 大 buffer 是权重的唯一存储：每个专家的 linear 权重把 param.data 重指向 buffer
+        # 切片（view），loader 的 copy_ 经 view 直接写入大 buffer。融合路径（grouped GEMM）
+        # 直接用 buffer：零拷贝、零额外显存——若首次 forward 才惰性 torch.cat，会完整复制
+        # 一份专家权重（30B EP=2 约 +29GB/rank，必 OOM，2026-08-19 真机实测）；遍历路径
+        # 则继续用 per-expert view 读同一份权重。
+        first = self.experts[str(self.local_expert_ids[0])]
+        gw, dw = first.gate_up_proj.weight, first.down_proj.weight
+        num_local = len(self.local_expert_ids)
+        self.w13 = torch.empty(num_local, *gw.shape, dtype=gw.dtype, device=gw.device)
+        self.w2 = torch.empty(num_local, *dw.shape, dtype=dw.dtype, device=dw.device)
+        for i, e in enumerate(self.local_expert_ids):
+            expert = self.experts[str(e)]
+            expert.gate_up_proj.weight.data = self.w13[i]
+            expert.down_proj.weight.data = self.w2[i]
 
     def _forward_loop(self, x: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor) -> torch.Tensor:
         """遍历式实现：每专家一个 gather + GEMM + scatter 累加（含 host 同步，大批次 GEMM 足够大时无所谓）"""
@@ -119,7 +115,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         use_triton = T <= FUSED_MAX_TOKENS and x.is_cuda and triton_available()
         use_bmm = T <= BMM_MAX_TOKENS and not use_triton
         if use_triton or use_bmm:
-            w13, w2 = self._fused_weights()
+            w13, w2 = self.w13, self.w2
             out = (fused_moe_triton if use_triton else fused_moe_bmm)(
                 x, topk_weights, topk_ids, self.local_start, w13, w2
             )

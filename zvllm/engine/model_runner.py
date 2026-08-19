@@ -52,13 +52,6 @@ class ModelRunner:
         else:
             self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
-        if getattr(hf_config, "model_type", "") == "qwen3_moe":
-            # MoE 融合路径的 stacked 权重在显存预算前预构建（30B EP=2 约 +1GB/rank）：
-            # 若在首次 decode forward 才惰性构建，KV cache 已按 0.9 利用率占满预算，
-            # torch.cat 的额外分配会 OOM（2026-08-19 EP=2 真机实测）。
-            for module in self.model.modules():
-                if hasattr(module, "_fused_weights"):
-                    module._fused_weights()
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
