@@ -37,7 +37,11 @@ class Config:
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         if getattr(self.hf_config, "model_type", "") == "qwen3_moe":
-            self.moe_tp_size = self.moe_tp_size or self.tensor_parallel_size
+            if self.moe_tp_size is None:
+                # 未显式指定专家内 TP：自动推导（纯 EP 模式）；显式指定 moe_tp_size 则为混合 TP*EP
+                assert self.tensor_parallel_size % self.moe_ep_size == 0, \
+                    f"tensor_parallel_size（{self.tensor_parallel_size}）必须能被 moe_ep_size（{self.moe_ep_size}）整除"
+                self.moe_tp_size = self.tensor_parallel_size // self.moe_ep_size
             assert self.moe_tp_size * self.moe_ep_size == self.tensor_parallel_size, \
                 f"moe_tp_size * moe_ep_size 必须等于 tensor_parallel_size（当前 {self.moe_tp_size} * {self.moe_ep_size} != {self.tensor_parallel_size}）"
             assert self.hf_config.num_experts % self.moe_ep_size == 0, \
