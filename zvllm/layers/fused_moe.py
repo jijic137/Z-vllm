@@ -10,8 +10,10 @@ decode 阶段每层 64 个本地专家 × 48 层 ≈ 3000 次同步 + 上万次 
 
 - fused_moe_triton：CUDA 上的 Triton grouped GEMM。把 (token, slot) 对按本地专家号
   排序（非本地对放进 dummy 桶），M 维按块对齐；两个 grouped GEMM kernel（gate_up、
-  down）+ torch silu&mul + 按路由权重 scatter。排序 / 对齐全部是 on-device torch
-  op，无 .any()/.item()/.nonzero()。
+  down）+ torch silu&mul + 按路由权重 scatter。两个 GEMM 共用一个 kernel，用
+  A_BY_TOKEN 区分行索引语义：gate_up 的输入 x [T,H] 按 token（pair//K）取行，
+  down 的输入 h [M_max,I] 按排序行取行。排序 / 对齐全部是 on-device torch op，
+  无 .any()/.item()/.nonzero()。
 - fused_moe_bmm：纯 torch 兜底（CPU / 无 Triton / Triton 不支持当前设备）。每个专家
   padding 到 R=T*K 行，两次 bmm；padding 行输入为 0，GEMM 输出严格为 0，不贡献。
 
@@ -94,7 +96,7 @@ if HAS_TRITON:
 
     @triton.jit
     def _moe_grouped_gemm(
-        a_ptr,      # [T, K_IN] bf16（x 或 h）
+        a_ptr,      # bf16：A_BY_TOKEN 时 [T, K_IN]（x，按 token 取行）；否则 [M_max, K_IN]（h，按排序行取行）
         w_ptr,      # [E, N_OUT, K_IN] bf16（stacked 专家权重）
         c_ptr,      # [M_max, N_OUT] bf16
         sorted_ids,  # [M_max] int32 pair id（哨兵 = N_PAIRS）
@@ -106,6 +108,7 @@ if HAS_TRITON:
         BM: tl.constexpr,
         BN: tl.constexpr,
         BK: tl.constexpr,
+        A_BY_TOKEN: tl.constexpr,
     ):
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
@@ -115,8 +118,11 @@ if HAS_TRITON:
         offs_m = pid_m * BM + tl.arange(0, BM)
         pair_ids = tl.load(sorted_ids + offs_m)
         valid = pair_ids < N_PAIRS
-        tokens = tl.where(valid, pair_ids // K_TOPK, 0)
-        a_ptrs = a_ptr + tokens[:, None].to(tl.int64) * K_IN + tl.arange(0, BK)[None, :]
+        if A_BY_TOKEN:
+            a_rows = tl.where(valid, pair_ids // K_TOPK, 0)
+        else:
+            a_rows = offs_m
+        a_ptrs = a_ptr + a_rows[:, None].to(tl.int64) * K_IN + tl.arange(0, BK)[None, :]
         b_ptrs = w_ptr + e.to(tl.int64) * (N_OUT * K_IN) \
             + (pid_n * BN + tl.arange(0, BN))[:, None].to(tl.int64) * K_IN \
             + tl.arange(0, BK)[None, :]
@@ -166,7 +172,7 @@ def fused_moe_triton(
     c1 = torch.empty((m_max, 2 * I), device=device, dtype=x.dtype)
     _moe_grouped_gemm[(m_max // _BM, (2 * I) // _BN)](
         x, w13, c1, sorted_ids, expert_ids, N,
-        K_TOPK=K, N_OUT=2 * I, K_IN=H, BM=_BM, BN=_BN, BK=_BK,
+        K_TOPK=K, N_OUT=2 * I, K_IN=H, BM=_BM, BN=_BN, BK=_BK, A_BY_TOKEN=True,
         num_warps=4, num_stages=3,
     )
     gate, up = c1.chunk(2, dim=1)
@@ -174,7 +180,7 @@ def fused_moe_triton(
     y = torch.empty((m_max, H), device=device, dtype=x.dtype)
     _moe_grouped_gemm[(m_max // _BM, H // _BN)](
         h, w2, y, sorted_ids, expert_ids, N,
-        K_TOPK=K, N_OUT=H, K_IN=I, BM=_BM, BN=_BN, BK=_BK,
+        K_TOPK=K, N_OUT=H, K_IN=I, BM=_BM, BN=_BN, BK=_BK, A_BY_TOKEN=False,
         num_warps=4, num_stages=3,
     )
     pair_valid = sorted_ids < N
