@@ -125,6 +125,7 @@ class QKVParallelLinear(ColumnParallelLinear):
     ):
         tp_size = _tp_rank_size(tp_group)[1]
         total_num_kv_heads = total_num_kv_heads or total_num_heads
+        self.total_num_heads = total_num_heads
         self.total_num_kv_heads = total_num_kv_heads
         self.head_size = head_size
         self.num_heads = divide(total_num_heads, tp_size)
