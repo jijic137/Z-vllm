@@ -87,7 +87,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 continue
             idx = mask.nonzero()
             y = expert(x[idx[:, 0]])
-            w = topk_weights[idx[:, 0], idx[:, 1]].unsqueeze(-1)
+            w = topk_weights[idx[:, 0], idx[:, 1]].to(x.dtype).unsqueeze(-1)
             out[idx[:, 0], idx[:, 1]] = y * w
         if self.tp_size > 1:
             dist.all_reduce(out, group=self.tp_group)
