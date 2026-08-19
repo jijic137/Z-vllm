@@ -271,7 +271,7 @@ MoE 数字来自 `bench_moe_ep.py`，best of 2 runs）：
 | 专家内 TP TP=2（`moe_ep_size=1`） | 29.5 – 30.6 | 2.1 |
 
 > 注：MoE decode 阶段经自研 Triton grouped-GEMM 融合（排序分桶 → 两个 grouped GEMM →
-> silu&mul → scatter → all_reduce）后，单层 MoE 子层 3.6 ms → 0.76 ms（约 4.7×），
+> silu&mul → scatter → all_reduce）后，单层 MoE 子层 3.65 ms → 0.76 ms（≈4.8×），
 > 端到端 EP=2 3.7 → 9.74 tok/s（约 2.6×）。EP≥2 后吞吐进入平台期：T=1 单请求下
 > 每步延迟由 attention 与逐层 all_reduce 主导，MoE 子层已非主要瓶颈。
 > 与 [Benchmark](#benchmark) 的稠密模型多请求批处理数字不可直接对比。
