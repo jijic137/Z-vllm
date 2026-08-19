@@ -1,10 +1,14 @@
 """MoE EP decode 吞吐 bench（README「已验证」口径：贪心 64 token，总墙钟 / 64）。
 
 用法（服务器 8×W7900D，权重已缓存于 ~/.cache/modelscope）：
-  torchrun --nproc_per_node=2 bench_moe_ep.py            # TP=2, 纯 EP=2
-  torchrun --nproc_per_node=4 bench_moe_ep.py            # TP=4, 纯 EP=4
-  torchrun --nproc_per_node=8 bench_moe_ep.py            # TP=8, 纯 EP=8
-  torchrun --nproc_per_node=8 bench_moe_ep.py --ep 4     # TP=8 内 4 个 EP 组 × 专家内 TP=2
+  python bench_moe_ep.py --tp 2 --ep 2     # 纯 EP=2（每卡 64 专家）
+  python bench_moe_ep.py --tp 4 --ep 4     # 纯 EP=4（每卡 32 专家）
+  python bench_moe_ep.py --tp 8 --ep 8     # 纯 EP=8（每卡 16 专家）
+  python bench_moe_ep.py --tp 8 --ep 4     # 4 个 EP 组 × 专家内 TP=2
+
+注意：引擎是单进程启动模型——主进程为 rank0 并自行 spawn tp-1 个 worker 进程，
+不要用 torchrun（每个 rank 进程都会再 spawn 一组 worker，两组进程抢同一个
+master_port 的 TCPStore 而死锁，2026-08-19 真机踩坑验证）。
 
 MoE 模型在 model_runner 中恒为 enforce_eager（CUDA graph 暂不支持 MoE），
 因此本脚本显式传 enforce_eager=True 只是把隐式行为写明。
