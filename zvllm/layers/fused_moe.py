@@ -159,7 +159,7 @@ def fused_moe_triton(
     N = T * K
     device = x.device
 
-    e_ids, _ = _route_local(topk_ids, local_start, E)
+    e_ids, is_local = _route_local(topk_ids, local_start, E)
     sorted_ids, expert_ids = _align_pairs(e_ids, E, _BM)
     m_max = sorted_ids.shape[0]
 
@@ -177,10 +177,14 @@ def fused_moe_triton(
         K_TOPK=K, N_OUT=H, K_IN=I, BM=_BM, BN=_BN, BK=_BK,
         num_warps=4, num_stages=3,
     )
-    valid = sorted_ids < N
-    rows = sorted_ids[valid].to(torch.int64)
+    pair_valid = sorted_ids < N
+    ids_safe = torch.where(pair_valid, sorted_ids, torch.zeros_like(sorted_ids)).to(torch.int64)
+    # 非本地对进 dummy 桶：kernel 跳过其 M 块（expert_ids=-1），c1/y 对应行未初始化，
+    # scatter 只取本地对；非本地位置保持 0，由跨 rank all_reduce 补齐完整加权和
+    row_valid = pair_valid & is_local[ids_safe]
+    rows = ids_safe[row_valid]
     out = torch.zeros((T, K, H), device=device, dtype=x.dtype)
-    out[rows // K, rows % K] = y[valid] * topk_weights.reshape(-1)[rows].to(x.dtype).unsqueeze(-1)
+    out[rows // K, rows % K] = y[row_valid] * topk_weights.reshape(-1)[rows].to(x.dtype).unsqueeze(-1)
     return out
 
 
