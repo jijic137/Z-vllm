@@ -3,6 +3,7 @@ from torch import nn
 import torch.distributed as dist
 
 from zvllm.layers.activation import SiluAndMul
+from zvllm.layers.fused_moe import BMM_MAX_TOKENS, FUSED_MAX_TOKENS, fused_moe_bmm, fused_moe_triton, triton_available
 from zvllm.layers.layernorm import RMSNorm
 from zvllm.layers.linear import MergedColumnParallelLinear, RowParallelLinear
 from zvllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
@@ -46,7 +47,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
     - 专家并行（moe_ep）：专家按组均分，每 rank 只算自己拥有的专家。
       "对专家加权和"是线性运算，全 world 一次 all_reduce 与 all-to-all 等价
       （省掉数据搬运，代价是通信量为 token 数的 topk 倍）。
-    遍历式 forward（可读优先）：每专家一个 gather + GEMM + scatter 累加。
+    小批次（T <= FUSED_MAX_TOKENS）走 fused_moe 融合路径（grouped GEMM，零 host 同步）；
+    大批次保留遍历式 forward（可读优先）：每专家一个 gather + GEMM + scatter 累加。
     """
 
     def __init__(
@@ -73,13 +75,27 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         })
         # router 全量复制在每个 rank：输入跨 rank 一致，top-k 结果天然一致，无需通信
         self.gate = nn.Linear(config.hidden_size, self.num_experts, bias=False)
+        self.local_start = self.local_expert_ids[0]
+        # 融合路径的 stacked 专家权重（惰性构建，见 _fused_weights）
+        self._w13: torch.Tensor | None = None
+        self._w2: torch.Tensor | None = None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 路由（softmax → top-k → 归一化，与 Qwen3-MoE 参考实现一致）
-        router_probs = torch.softmax(self.gate(x).float(), dim=-1)
-        topk_weights, topk_ids = torch.topk(router_probs, self.topk, dim=-1)
-        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
-        # 输出按 (token, slot) 组织，非本地专家的位置为 0，跨 rank 求和即 all_reduce
+    def _fused_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """构建融合路径的 stacked 权重：w13 [E, 2I_local, H]（前 I 行 gate、后 I 行 up）、
+        w2 [E, H, I_local]。loader 是原地 copy_ 进 ModuleDict 参数，加载完成后内容才就绪，
+        故在首次 forward 时构建一次并缓存（30B EP=2 约 +0.6GB/rank）。MoE 恒为 eager
+        （见 model_runner），不会撞 CUDA graph capture。"""
+        if self._w13 is None:
+            w13, w2 = [], []
+            for e in self.local_expert_ids:
+                w13.append(self.experts[str(e)].gate_up_proj.weight.unsqueeze(0))
+                w2.append(self.experts[str(e)].down_proj.weight.unsqueeze(0))
+            self._w13 = torch.cat(w13, dim=0).contiguous()
+            self._w2 = torch.cat(w2, dim=0).contiguous()
+        return self._w13, self._w2
+
+    def _forward_loop(self, x: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor) -> torch.Tensor:
+        """遍历式实现：每专家一个 gather + GEMM + scatter 累加（含 host 同步，大批次 GEMM 足够大时无所谓）"""
         out = torch.zeros(x.shape[0], self.topk, x.shape[1], device=x.device, dtype=x.dtype)
         for e_id, expert in self.experts.items():
             mask = topk_ids == int(e_id)
@@ -89,6 +105,24 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             y = expert(x[idx[:, 0]])
             w = topk_weights[idx[:, 0], idx[:, 1]].to(x.dtype).unsqueeze(-1)
             out[idx[:, 0], idx[:, 1]] = y * w
+        return out
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 路由（softmax → top-k → 归一化，与 Qwen3-MoE 参考实现一致）
+        router_probs = torch.softmax(self.gate(x).float(), dim=-1)
+        topk_weights, topk_ids = torch.topk(router_probs, self.topk, dim=-1)
+        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+        # 输出按 (token, slot) 组织，非本地专家的位置为 0，跨 rank 求和即 all_reduce
+        T = x.shape[0]
+        use_triton = T <= FUSED_MAX_TOKENS and x.is_cuda and triton_available()
+        use_bmm = T <= BMM_MAX_TOKENS and not use_triton
+        if use_triton or use_bmm:
+            w13, w2 = self._fused_weights()
+            out = (fused_moe_triton if use_triton else fused_moe_bmm)(
+                x, topk_weights, topk_ids, self.local_start, w13, w2
+            )
+        else:
+            out = self._forward_loop(x, topk_weights, topk_ids)
         if self.tp_size > 1:
             dist.all_reduce(out, group=self.tp_group)
         if self.ep_size > 1:
