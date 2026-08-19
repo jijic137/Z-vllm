@@ -18,7 +18,7 @@
 * ✂️ **Chunked prefill** — 长 prompt 分块 prefill，与 decode 交错执行
 * 🧩 **Prefix caching** — 相同前缀跨请求共享，节省 prefill 计算
 * 🧮 **张量并行** — 支持 1–8 卡
-* 🧱 **专家并行（EP）** — MoE 专家切分到多卡，专家内 TP × EP 任意组合
+* 🧱 **专家并行（EP）** — MoE 专家切分到多卡，专家内 TP × EP 任意组合；decode 阶段 Triton grouped-GEMM 融合路径
 * ⚡ **CUDA graph + torch.compile** — 捕获 decode 图，降低 launch 开销
 * 🤖 **支持 Qwen3 稠密与 MoE 模型** — 如 Qwen3-0.6B、Qwen3-30B-A3B
 * 🎲 **完整采样** — 贪心（temperature=0）、top-k、top-p、seed 可复现
@@ -248,29 +248,40 @@ print(resp.choices[0].message.content)
 * **AMD 单卡稠密吞吐**：Qwen3-0.6B，1× W7900D，SDPA 兜底 + eager，256 请求 / 133,966 输出 token，
   聚合吞吐 480.21 tok/s（278.97 s）；同一 256 请求集下上游 CUDA flash-attn + CUDA graph 配置为
   1434 tok/s（见 [Benchmark](#benchmark)），差距来自 attention 后端与图模式
-* **MoE 专家并行（EP）**：Qwen3-30B-A3B（128 专家 / 48 层全 MoE / bf16），TP=2
-  * `moe_ep_size=2`（纯 EP，每卡 64 专家）与 `moe_ep_size=1`（专家内 TP=2）均正确生成
-  * CPU 单测：EP 路径 MoE 前向与逐 token 参照一致（bf16，max_diff 0.0）
-  * 两种模式各自跨进程重复运行输出逐字节可复现；模式间输出差异来自浮点求和顺序
-    （EP 无 all-reduce vs 专家内 TP all-reduce），均为连贯正确的英文输出
+* **MoE 专家并行（EP）**：Qwen3-30B-A3B（128 专家 / 48 层全 MoE / bf16）
+  * TP=2 / 4 / 8 均端到端跑通；纯 EP（`moe_ep_size=N`）与专家内 TP（`moe_ep_size=1`）均正确生成
+  * CPU 单测：EP 路径 MoE 前向与逐 token 参照一致（bf16，max_diff 0.0）；
+    Triton 融合路径与 bmm 兜底路径位级一致（max_diff 0.0）
+  * TP 超过 KV head 数（8 卡跑 4 KV head 模型）时复制 KV head，
+    GQA 连续映射经权重级单测校验（每 rank 取到与其 q head 对应的 kv head）
+  * 专家权重以原生 stacked 大 buffer 存储（各专家权重是 buffer 的 view），
+    融合路径零拷贝、零额外显存
+  * 同一配置跨进程重复运行输出逐字节可复现；EP=2/4/8 输出文本一致
+    （差异仅来自 bf16 求和顺序），均为连贯正确的英文输出
 
-性能数据（Qwen3-30B-A3B，TP=2，W7900D × 2，SDPA 兜底，单请求，prompt ≈ 10 token / 生成 64 token，贪心）：
+性能数据（Qwen3-30B-A3B，W7900D，SDPA 兜底，单请求，prompt ≈ 10 token / 生成 64 token，贪心；
+MoE 数字来自 `bench_moe_ep.py`，best of 2 runs）：
 
 | 并行模式 | 耗时 (s) | 吞吐 (tokens/s) |
 |---|---|---|
-| 纯 EP（`moe_ep_size=2`，专家内 TP 自动推导 = 1） | 17.3 – 17.4 | 3.7 |
-| 专家内 TP（`moe_ep_size=1`） | 29.5 – 30.6 | 2.1 |
+| 纯 EP TP=2（优化前基线，逐专家 gather 循环） | 17.3 – 17.4 | 3.7 |
+| 纯 EP TP=2（Triton grouped-GEMM 融合） | 6.57 | 9.74 |
+| 纯 EP TP=4（Triton 融合） | 6.75 | 9.49 |
+| 纯 EP TP=8（Triton 融合，KV head 复制） | 6.68 | 9.58 |
+| 专家内 TP TP=2（`moe_ep_size=1`） | 29.5 – 30.6 | 2.1 |
 
-> 注：MoE decode 吞吐当前受逐专家 gather 循环与 host 同步（每层 64 专家 × 48 层/步）
-> 限制，属预期开销而非缺陷；与 [Benchmark](#benchmark) 的稠密模型多请求批处理数字
-> 不可直接对比。
+> 注：MoE decode 阶段经自研 Triton grouped-GEMM 融合（排序分桶 → 两个 grouped GEMM →
+> silu&mul → scatter → all_reduce）后，单层 MoE 子层 3.6 ms → 0.76 ms（约 4.7×），
+> 端到端 EP=2 3.7 → 9.74 tok/s（约 2.6×）。EP≥2 后吞吐进入平台期：T=1 单请求下
+> 每步延迟由 attention 与逐层 all_reduce 主导，MoE 子层已非主要瓶颈。
+> 与 [Benchmark](#benchmark) 的稠密模型多请求批处理数字不可直接对比。
 
 ## Roadmap
 
 - [ ] 支持更多模型家族（LLaMA、Qwen2 等）
 - [ ] 权重量化支持（AWQ / GPTQ）
 - [ ] 逐请求取消与停止串（stop strings）
-- [ ] MoE decode 性能优化（逐专家 gather / host 同步，Triton 融合）
+- [x] MoE decode 性能优化（Triton grouped-GEMM 融合路径，EP=2 3.7 → 9.74 tok/s，约 2.6×）
 - [ ] ROCm 加速：flash-attn ROCm 编译、CUDA graph 兼容性
 
 ## 来源与许可
