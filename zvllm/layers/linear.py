@@ -5,8 +5,23 @@ import torch.distributed as dist
 
 
 def divide(numerator, denominator):
+    assert denominator > 0, f"denominator must be positive, got {denominator}"
     assert numerator % denominator == 0
     return numerator // denominator
+
+
+def _tp_rank_size(tp_group: "dist.ProcessGroup | None") -> tuple[int, int]:
+    """取 TP 组内的 (rank, world_size)。
+
+    PyTorch 对单 rank 的 NCCL/RCCL 子组，get_world_size 可能返回 -1
+    （元数据未初始化）——纯 EP（moe_tp_size=1）时每个专家组即单卡组，
+    此处归一化为 (0, 1)。
+    """
+    rank = dist.get_rank(tp_group)
+    size = dist.get_world_size(tp_group)
+    if size in (-1, 1):
+        return 0, 1
+    return rank, size
 
 
 class LinearBase(nn.Module):
@@ -23,8 +38,7 @@ class LinearBase(nn.Module):
         self.tp_dim = tp_dim
         # tp_group 为 None 表示全局 TP 组（attention 等）；MoE 专家传入专家内 TP 子组
         self.tp_group = tp_group
-        self.tp_rank = dist.get_rank(tp_group)
-        self.tp_size = dist.get_world_size(tp_group)
+        self.tp_rank, self.tp_size = _tp_rank_size(tp_group)
         self.weight = nn.Parameter(torch.empty(output_size, input_size))
         self.weight.weight_loader = self.weight_loader
         if bias:
@@ -63,7 +77,8 @@ class ColumnParallelLinear(LinearBase):
         bias: bool = False,
         tp_group: "dist.ProcessGroup | None" = None,
     ):
-        super().__init__(input_size, divide(output_size, dist.get_world_size(tp_group)), bias, 0, tp_group)
+        world_size = _tp_rank_size(tp_group)[1]
+        super().__init__(input_size, divide(output_size, world_size), bias, 0, tp_group)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
@@ -108,7 +123,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         bias: bool = False,
         tp_group: "dist.ProcessGroup | None" = None,
     ):
-        tp_size = dist.get_world_size(tp_group)
+        tp_size = _tp_rank_size(tp_group)[1]
         total_num_kv_heads = total_num_kv_heads or total_num_heads
         self.total_num_kv_heads = total_num_kv_heads
         self.head_size = head_size
@@ -153,7 +168,8 @@ class RowParallelLinear(LinearBase):
         bias: bool = False,
         tp_group: "dist.ProcessGroup | None" = None,
     ):
-        super().__init__(divide(input_size, dist.get_world_size(tp_group)), output_size, bias, 1, tp_group)
+        world_size = _tp_rank_size(tp_group)[1]
+        super().__init__(divide(input_size, world_size), output_size, bias, 1, tp_group)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
