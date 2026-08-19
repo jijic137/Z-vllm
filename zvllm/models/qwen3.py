@@ -31,8 +31,13 @@ class Qwen3Attention(nn.Module):
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
         self.total_num_kv_heads = num_kv_heads
-        assert self.total_num_kv_heads % tp_size == 0
-        self.num_kv_heads = self.total_num_kv_heads // tp_size
+        if self.total_num_kv_heads % tp_size == 0:
+            self.num_kv_heads = self.total_num_kv_heads // tp_size
+        else:
+            # TP 超过 KV head 数（如 8 卡跑 4 KV head 模型）：复制 KV head，每 rank 持有 1 个
+            #（与 QKVParallelLinear 复制模式、allocate_kv_cache 的 per-rank 头数口径一致）
+            assert tp_size % self.total_num_kv_heads == 0
+            self.num_kv_heads = 1
         self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim

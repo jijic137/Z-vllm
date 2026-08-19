@@ -154,8 +154,14 @@ class QKVParallelLinear(ColumnParallelLinear):
         if loaded_shard_id == "q" or self.num_kv_heads * self.tp_size == self.total_num_kv_heads:
             loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
         else:
-            # KV head 复制：rank r 取 head 组 r % total_num_kv_heads
-            loaded_weight = loaded_weight.chunk(self.total_num_kv_heads, self.tp_dim)[self.tp_rank % self.total_num_kv_heads]
+            # KV head 复制：TP 超过 KV head 数（如 8 卡跑 4 KV head 模型）。GQA 连续映射下
+            # rank r 的 q head [r*num_heads, ...) 全部落在同一个 kv head 上：
+            # kv_head = 首个 q head 号 // (总 q head / 总 kv head)
+            # （2026-08-19 EP=8 真机踩坑：旧实现取 r % total_num_kv_heads，
+            #  8 卡 4 KV head 时 rank 1/3/5/7 取错 kv head，注意力结果错误）
+            first_q = self.tp_rank * self.num_heads
+            kv_head = first_q // (self.total_num_heads // self.total_num_kv_heads)
+            loaded_weight = loaded_weight.chunk(self.total_num_kv_heads, self.tp_dim)[kv_head]
         param_data.copy_(loaded_weight)
 
 
