@@ -82,9 +82,11 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
     def _fused_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
         """构建融合路径的 stacked 权重：w13 [E, 2I_local, H]（前 I 行 gate、后 I 行 up）、
-        w2 [E, H, I_local]。loader 是原地 copy_ 进 ModuleDict 参数，加载完成后内容才就绪，
-        故在首次 forward 时构建一次并缓存（30B EP=2 约 +0.6GB/rank）。MoE 恒为 eager
-        （见 model_runner），不会撞 CUDA graph capture。"""
+        w2 [E, H, I_local]（30B EP=2 实测 +1.0GB/rank：w13 805MB + w2 197MB）。
+        由 ModelRunner 在 load_model 之后、显存预算（warmup profiling + KV cache 分配）
+        之前预构建一次并缓存：若在首次 decode forward 才构建，KV cache 已按
+        gpu_memory_utilization 占满预算，cat 的额外分配会 OOM（2026-08-19 EP=2 实测）。
+        MoE 恒为 eager（见 model_runner），不会撞 CUDA graph capture。"""
         if self._w13 is None:
             w13, w2 = [], []
             for e in self.local_expert_ids:
