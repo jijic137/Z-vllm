@@ -58,11 +58,13 @@ def test_pickle_roundtrip():
     assert s2.token_ids == [1, 2, 3, 4, 5, 6]
     assert s2.block_table == [7, 3]
     assert s2.num_cached_tokens == 4
+    assert s2.is_prefill is True
     # decode 阶段只传 last_token，token_ids 为空
     s1.is_prefill = False
     s3 = pickle.loads(pickle.dumps(s1))
     assert s3.last_token == 6 and s3.token_ids == []
     assert len(s3) == 6
+    assert s3.is_prefill is False
     print("test_pickle_roundtrip OK")
 
 

@@ -20,6 +20,7 @@ class ModelRunner:
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
+        Sequence.block_size = config.kvcache_block_size    # worker 进程反序列化的对象也依赖该类属性算块数
         self.enforce_eager = config.enforce_eager
         self.world_size = config.tensor_parallel_size
         self.rank = rank
