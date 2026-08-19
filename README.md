@@ -245,6 +245,9 @@ print(resp.choices[0].message.content)
 * **ROCm（AMD）**：2 × W7900D 48GB，ROCm 7.1 / torch 2.11（rocm 构建）。代码路径零改动
   （`nccl` 后端自动映射 RCCL），未装 flash-attn 时自动 SDPA 兜底 + `enforce_eager=True`，
   权重经魔搭社区下载
+* **AMD 单卡稠密吞吐**：Qwen3-0.6B，1× W7900D，SDPA 兜底 + eager，256 请求 / 133,966 输出 token，
+  聚合吞吐 480.21 tok/s（278.97 s）；同一 256 请求集下上游 CUDA flash-attn + CUDA graph 配置为
+  1434 tok/s（见 [Benchmark](#benchmark)），差距来自 attention 后端与图模式
 * **MoE 专家并行（EP）**：Qwen3-30B-A3B（128 专家 / 48 层全 MoE / bf16），TP=2
   * `moe_ep_size=2`（纯 EP，每卡 64 专家）与 `moe_ep_size=1`（专家内 TP=2）均正确生成
   * CPU 单测：EP 路径 MoE 前向与逐 token 参照一致（bf16，max_diff 0.0）
