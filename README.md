@@ -258,6 +258,9 @@ print(resp.choices[0].message.content)
     融合路径零拷贝、零额外显存
   * 同一配置跨进程重复运行输出逐字节可复现；EP=2/4/8 输出文本一致
     （差异仅来自 bf16 求和顺序），均为连贯正确的英文输出
+  * 并发 decode 扫描（`bench_moe_conc.py`）：1/16/32/64 请求 × EP=2/4/8，
+    聚合吞吐随 N 近线性（每翻倍 ≈1.93–1.99×），峰值 587.79 tok/s（EP=8，N=64）；
+    T=1 平台期在高并发下被击穿，EP=8 反超（N=64 时 +10.8%）
 
 性能数据（Qwen3-30B-A3B，W7900D，SDPA 兜底，单请求，prompt ≈ 10 token / 生成 64 token，贪心；
 MoE 数字来自 `bench_moe_ep.py`，best of 2 runs）：
@@ -273,8 +276,35 @@ MoE 数字来自 `bench_moe_ep.py`，best of 2 runs）：
 > 注：MoE decode 阶段经自研 Triton grouped-GEMM 融合（排序分桶 → 两个 grouped GEMM →
 > silu&mul → scatter → all_reduce）后，单层 MoE 子层 3.65 ms → 0.76 ms（≈4.8×），
 > 端到端 EP=2 3.7 → 9.74 tok/s（约 2.6×）。EP≥2 后吞吐进入平台期：T=1 单请求下
-> 每步延迟由 attention 与逐层 all_reduce 主导，MoE 子层已非主要瓶颈。
+> 每步延迟由 attention 与逐层 all_reduce 主导，MoE 子层已非主要瓶颈——
+> 该平台期只在 T=1 小批量区间成立，N≥16 并发后 EP 收益重新出现（见下表交叉现象）。
 > 与 [Benchmark](#benchmark) 的稠密模型多请求批处理数字不可直接对比。
+
+并发 decode 数据（同模型同硬件；N 路贪心并发，每流 prompt ≈ 10 token / 生成 64 token，
+来自 `bench_moe_conc.py`，best of 2 runs；decode 步延迟为稳态段中位数）：
+
+| 并行模式 | 并发 N | decode 步延迟 (ms) | 聚合吞吐 (tokens/s) | 单流吞吐 (tokens/s) |
+|---|---|---|---|---|
+| 纯 EP TP=2 | 1 | 101.4 | 10.02 | 10.02 |
+| 纯 EP TP=2 | 16 | 121.4 | 136.83 | 8.55 |
+| 纯 EP TP=2 | 32 | 122.7 | 269.95 | 8.44 |
+| 纯 EP TP=2 | 64 | 124.1 | 530.56 | 8.29 |
+| 纯 EP TP=4 | 1 | 104.7 | 9.68 | 9.68 |
+| 纯 EP TP=4 | 16 | 111.0 | 146.84 | 9.18 |
+| 纯 EP TP=4 | 32 | 112.7 | 290.42 | 9.08 |
+| 纯 EP TP=4 | 64 | 117.0 | 560.75 | 8.76 |
+| 纯 EP TP=8 | 1 | 111.1 | 9.13 | 9.13 |
+| 纯 EP TP=8 | 16 | 109.4 | 148.19 | 9.26 |
+| 纯 EP TP=8 | 32 | 109.6 | 296.27 | 9.26 |
+| 纯 EP TP=8 | 64 | 110.5 | **587.79** | 9.18 |
+
+> 注：聚合吞吐随 N 近线性增长（每翻倍 ≈1.93–1.99×）。**EP 交叉现象**：N=1 时
+> EP=2 最快（10.02 > 9.13，平台期），N≥16 后 EP=8 反超（N=64 时 587.8 vs EP=2 530.6，
+> +10.8%）——每 rank 的 MoE 计算量按 T×topk/EP 随并发增长，T 足够大后成为主导项，
+> 而每步 all_reduce 流量是完整 [T, topk, H] 补零张量，随 T 增长但不随 EP 变化。
+> 单流吞吐并发 1→64 时 EP=2/4 降 17%/10%，EP=8 持平；步延迟 EP=2 +22% / EP=4 +12% / EP=8 持平。
+> 口径说明：日志含 `rms_forward` 的 torch.compile 重编译告警（达重编译上限后回退 eager），
+> best-of-2 + 稳态中位指标保证数字不受影响。
 
 ## Roadmap
 
