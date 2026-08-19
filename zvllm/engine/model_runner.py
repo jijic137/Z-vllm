@@ -248,7 +248,7 @@ class ModelRunner:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         sample_args = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(*sample_args).tolist() if self.rank == 0 else None
+        token_ids = self.sampler(logits, *sample_args).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
 
