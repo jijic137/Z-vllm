@@ -111,8 +111,11 @@ if HAS_TRITON:
             + (pid_n * BN + tl.arange(0, BN))[:, None].to(tl.int64) * K_IN \
             + tl.arange(0, BK)[None, :]
         if QUANT_W:
+            # b_s_base 保持 1D [BN]：tl.load 出 [BN] scale 后 [:, None] 广播为 [BN,1]。
+            # 若这里带 [:, None]（2D 指针），load 出 [BN,1]，再 [:, None] 会膨胀成
+            # rank-3 [BN,BN,BK]，tl.dot 直接编译失败（仅 GPU 编译期暴露）。
             b_s_base = w_s_ptr + e.to(tl.int64) * (N_OUT * (K_IN // GROUP)) \
-                + (pid_n * BN + tl.arange(0, BN))[:, None].to(tl.int64) * (K_IN // GROUP)
+                + (pid_n * BN + tl.arange(0, BN)).to(tl.int64) * (K_IN // GROUP)
         acc = tl.zeros((BM, BN), dtype=tl.float32)
         for k in range(0, K_IN, BK):
             a = tl.load(a_ptrs, mask=valid[:, None], other=0.0)

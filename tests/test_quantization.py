@@ -1,4 +1,5 @@
-"""Weight-only W8 量化纯 CPU 单测（无需 GPU/triton/flash_attn）。运行：python tests/test_quantization.py
+"""Weight-only W8 量化单测（CPU 部分无需 GPU/triton/flash_attn；Triton kernel 部分
+有 GPU/Triton 才跑，否则跳过）。运行：python tests/test_quantization.py
 
 覆盖：
 - quantize/dequant 往返：逐元素误差上界（量化步长 + bf16 scale 舍入 + 乘积 bf16 舍入），
@@ -14,6 +15,9 @@
 - fused_moe_bmm 量化路径 vs 手工反量化参照（对拍闭环：参照不复用 dequantize_weight）
 - 模型接线：Qwen3 dense 的 int8/scale 参数计数与 embed/lm_head 保持原 dtype；
   MoE 块 scale stacked buffer 的 view 重指向 + 量化 forward vs 手工参照
+- Triton fused_moe QUANT_W 分支（GPU 条件）：与 bf16 分支 bit-exact——两分支消费
+  同一 bf16 反量化权重（回归：b_s_base 多余 [:, None] 的 rank-3 形状 bug 只在
+  GPU 编译期暴露，CPU 单测走 bmm 路径抓不到）
 """
 import dataclasses
 import socket
@@ -31,7 +35,8 @@ import zvllm.layers.linear as linear_mod
 from zvllm.layers.linear import (
     ColumnParallelLinear, MergedColumnParallelLinear, QKVParallelLinear, RowParallelLinear,
 )
-from zvllm.layers.fused_moe import fused_moe_bmm
+from zvllm.layers.fused_moe import fused_moe_bmm, fused_moe_triton
+from zvllm.layers.triton_utils import triton_available
 from zvllm.quantization import WEIGHT_GROUP, quantize_weight, dequantize_weight
 
 
@@ -317,6 +322,41 @@ def test_model_wiring():
         torch.set_default_dtype(default_dtype)
 
 
+def test_fused_moe_triton_quantized_gpu():
+    """Triton fused_moe QUANT_W 分支（仅 GPU/Triton 可用时运行，否则跳过）。
+
+    回归背景：QUANT_W 分支的 b_s_base 曾多一个 [:, None]，scale 指针变成
+    2D [BN,1]，tl.load 出 [BN,1] 后再次 [:, None] 膨胀为 rank-3 [BN,BN,BK]，
+    tl.dot 编译失败。该 bug 只在 GPU 编译期暴露（CPU 单测走 bmm 物化路径）。
+    验收口径：kernel 内反量化 (q*s).to(bf16) 与 dequantize_weight 逐位一致，
+    故 quant 分支与 bf16 分支（同一 bf16 权重值）输出必须 bit-exact。
+    """
+    if not (torch.cuda.is_available() and triton_available()):
+        print("  Triton W8 grouped GEMM: 无 GPU/Triton，跳过")
+        return
+    print("Triton fused_moe QUANT_W 分支 (GPU)")
+    torch.manual_seed(1)
+    E, T, K, H, I = 8, 17, 2, 512, 256
+    dev = "cuda"
+    x = (torch.randn(T, H) * 0.5).bfloat16().to(dev)
+    w13 = (torch.randn(E, 2 * I, H) * 0.3).bfloat16()
+    w2 = (torch.randn(E, H, I) * 0.3).bfloat16()
+    gw = torch.rand(T, K)
+    tw = (gw / gw.sum(-1, keepdim=True)).bfloat16().to(dev)
+    base = torch.arange(T * K) % E
+    tid = base[torch.randperm(T * K)].reshape(T, K).to(torch.int64).to(dev)
+    assert set(tid.cpu().flatten().tolist()) == set(range(E))
+    q13, s13 = quantize_weight(w13)
+    q2, s2 = quantize_weight(w2)
+    out_q = fused_moe_triton(x, tw, tid, 0,
+                             q13.to(dev), q2.to(dev), s13.to(dev), s2.to(dev))
+    out_bf = fused_moe_triton(x, tw, tid, 0,
+                              dequantize_weight(q13, s13).to(dev),
+                              dequantize_weight(q2, s2).to(dev))
+    assert torch.equal(out_q, out_bf), "Triton W8 分支应与 bf16 分支 bit-exact"
+    print("  Triton W8 grouped GEMM 与 bf16 分支 bit-exact: OK")
+
+
 def main():
     test_roundtrip()
     test_zero_group()
@@ -327,6 +367,7 @@ def main():
     test_config_weight_bits()
     test_fused_moe_bmm_quantized()
     test_model_wiring()
+    test_fused_moe_triton_quantized_gpu()
     print("ALL PASSED: test_quantization")
 
 
