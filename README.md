@@ -20,6 +20,7 @@
 * 🧮 **张量并行** — 支持 1–8 卡
 * 🧱 **专家并行（EP）** — MoE 专家切分到多卡，专家内 TP × EP 任意组合；decode 阶段 Triton grouped-GEMM 融合路径
 * 🗜️ **权重量化（W8A16）** — `weight_bits=8` 加载时 int8 量化（per-group 128 对称），kernel 内反量化融合 GEMM；Qwen3-30B-A3B 57GB → 约 29GB，单张 48GB 卡跑 30B MoE
+* 🪃 **投机解码（n-gram 草稿）** — 零训练自历史 n-gram 草稿，验证步单次 forward 接受-拒绝，输出分布与目标严格一致；贪心 A/B 一致性门槛 + 性能基准
 * ⚡ **CUDA graph + torch.compile** — 捕获 decode 图，降低 launch 开销
 * 🤖 **支持 Qwen3 / LLaMA / Qwen2 模型家族（稠密 + MoE）** — 如 Qwen3-0.6B、Qwen3-30B-A3B、Llama-3.2-1B、Qwen2-0.5B
 * 🎲 **完整采样** — 贪心（temperature=0）、top-k、top-p、seed 可复现
@@ -54,6 +55,7 @@
     │   ├── activation.py
     │   ├── rotary_embedding.py
     │   ├── sampler.py
+    │   ├── spec_decode.py    # 投机解码接受-拒绝（确定性草稿特例，CPU 可单测）
     │   └── embed_head.py
     ├── models/
     │   ├── __init__.py       # model_type 注册与分发（qwen3 / qwen3_moe / llama / qwen2）
@@ -175,6 +177,9 @@ for event in llm.generate(["Hello, Z-vLLM."], sampling_params, stream=True):
 | `tensor_parallel_size` | 1 | 张量并行卡数（1–8） |
 | `model_source` | "auto" | 非本地模型 ID 的权重来源：auto（魔搭优先→HF）/ modelscope / hf |
 | `weight_bits` | 16 | 权重量化：16（bf16，默认）/ 8（int8 加载时量化，per-group 128 对称，kernel 内反量化；int4 暂不支持） |
+| `spec_decode` | "off" | 投机解码：off（默认）/ ngram（零训练 n-gram 草稿） |
+| `spec_gamma` | 4 | 每步最多草稿 token 数（1–8，仅 ngram 生效） |
+| `spec_ngram` | 4 | n-gram 匹配长度（2–8，仅 ngram 生效） |
 | `enforce_eager` | False | True 时禁用 CUDA graph |
 | `kvcache_block_size` | 256 | 每个 KV 块的 token 数（须为 256 的倍数） |
 | `moe_tp_size` | 自动推导 | MoE 专家内 TP 卡数；缺省 = 卡数 / `moe_ep_size`（即纯 EP），显式指定可组合混合 TP×EP |
@@ -203,6 +208,64 @@ llm = LLM("Qwen/Qwen3-30B-A3B", tensor_parallel_size=8, moe_ep_size=8)  # 纯 EP
 ```
 
 MoE 模型自动禁用 CUDA graph（强制 `enforce_eager`）。
+
+## 投机解码
+
+零训练 n-gram 投机解码：草稿取自序列自身历史（PLD），目标模型一次 forward 对草稿做接受-拒绝验证——没有草稿模型、没有额外 draft forward。
+
+```python
+llm = LLM("Qwen/Qwen3-0.6B", spec_decode="ngram", spec_gamma=4, spec_ngram=4)
+```
+
+机制：调度在每个 decode 步查序列自身历史的尾部 n-gram 重复匹配，取至多 γ 个草稿 token（零额外 forward）；验证步把 `[last_token, 草稿…]` 回喂进一次 varlen forward，LM head 对带草稿序列保留整段 1+γ 行 logit（非投机序列仍只保留末行，批内无草稿时走"仅末行"快速路径）；接受-拒绝按 Leviathan et al. 2023 确定性草稿特例——贪心退化为 argmax 匹配，随机采样以概率 p(x) 接受草稿、首次拒绝时从残差分布补一个 bonus token，每步输出分布严格等于目标分布，投机不改变任何质量属性。
+
+接受率统计：`engine.spec_stats`（`proposed_tokens` / `accepted_tokens` / `steps`，接受率 = accepted / proposed）。
+
+### 正确性验证（A/B 门槛）
+
+`ab_spec_greedy.py`（GPU 门槛，Qwen3-0.6B / bf16 / 贪心 / γ=4 / n=4，5 个进程级隔离子进程）：
+
+| 判据 | 口径 | 结果 |
+|---|---|---|
+| A | 单序列 off vs on 逐位一致（硬门槛） | PASS（128 tokens 逐位一致） |
+| B | 3 序列逐 prompt：未用草稿必逐位一致；用过草稿时首个分歧点两侧决定行须近 tie（min(gap_top2) ≤ 0.5）且此前无 argmax 早翻 | PASS（见下） |
+| C | on3b 跨进程重跑 vs on3 逐位一致（确定性，硬门槛） | PASS（3/3 prompts） |
+
+B 的细节：prompt 0 首个分歧 at 29，此前逐位一致；分歧点两侧决定行均为 4 路精确 bf16 tie（top2 gap = 0.0000，min_gap 0.0 ≤ 0.5）：
+
+| 侧 | top-5 logit（分歧点决定行） |
+|---|---|
+| off | 2701:17.000  96934:17.000  1156:16.875  5128:16.875  1555:16.375 |
+| on | 1156:17.000  2701:17.000  5128:17.000  96934:17.000  1555:16.375 |
+
+ulp 级漂移翻转 tie-break 即产生分歧。prompts 1/2 即使用了草稿也逐位一致。
+
+根因（B2 实验链）：off 侧自身批形状变化不引入漂移（M=3 vs M=1 逐位一致）；KV 漂移是移动前沿——首个草稿命中（产出序号 19）之前的位置逐位零漂移，之后每个新写位置带 ≤1 个 bf16 ulp 漂移、旧位置永久一致，无块错读/mask 错位；分歧后 97 个 argmax 分歧全部 ≥ 分歧点（级联）。业界对照：vLLM 等也不保证 bf16 下 spec on/off 逐位一致（验证行与 decode 行批形状不同是设计使然）。
+
+口径：单序列 A/B 逐位一致为硬门槛（该栈 verify M=5 vs decode M=1 逐位相同，实测 3/3 绿）；多序列改用近 tie 容差门槛，避免把 bf16 固有数值行为误判为 bug。
+
+### 性能（bench_spec.py）
+
+`bench_spec.py`：Qwen3-0.6B，1× W7900D（SDPA 兜底 + eager），贪心，8 并发 × 192 输出 token，
+随机 token-id prompt（128–300 token），已排除 warmup：
+
+| 指标 | spec off | spec on | 加速比 |
+|---|---|---|---|
+| TTFT mean (ms) | 100.3 | 100.5 | 1.00 |
+| TTFT p95 (ms) | 100.3 | 100.5 | 1.00 |
+| TPOT mean (ms) | 30.75 | 23.31 | **1.32** |
+| TPOT median (ms) | 30.75 | 18.38 | **1.67** |
+| 聚合吞吐 (tok/s) | 257.1 | 193.1 | 0.75 |
+
+接受率 0.958（proposed 889 / accepted 852，231 个 spec 步）；wall 5.97 s → 7.95 s。
+
+如实说明：逐序列 inter-token 延迟（TPOT）确实下降，但该配置下聚合吞吐降至 0.75×。机制：
+① 批内任一序列带草稿，整批即走 varlen forward（验证步每序列至多 1+γ 行），全批的
+decode 快路径被更慢的路径替代；② 0.6B 的 decode 步本身很短（30.75 ms/step @ batch 8），
+小模型摊不平验证开销；③ 各序列接受度漂移（TPOT mean 23.31 vs median 18.38），wall 由最慢
+序列决定（≈41 ms/token，比 off 的 30.75 还慢）——低接受序列在昂贵的 varlen 步里只拿到
+1 个 token。投机解码的收益区间是 decode 步长的场景（大模型 / 低并发单流），小模型高并发
+恰是其最差配置。
 
 ## OpenAI 兼容服务
 
@@ -284,6 +347,11 @@ print(resp.choices[0].message.content)
   * 精度：Qwen3-0.6B ΔPPL +0.0845（≤ 0.1）；30B 贪心 A/B（W8 vs bf16）主体一致、仅量化噪声级分歧
   * kernel 对拍：稠密 `quant_linear` 相对误差 ≤ 2.1e-3（vs 物化反量化 mm）；MoE Triton QUANT_W 分支与 bf16 分支位级一致（max_diff 0.0）
   * 速度（30B-A3B，4 prompt × 64 token 混合）：EP=2 W8 26.0 vs bf16 32.7 tok/s（小批量反量化开销，如实记录）；单卡 W8 30.7 tok/s
+* **投机解码（n-gram）**：2026-08-20，1× W7900D + Qwen3-0.6B（bf16，γ=4 / n=4，贪心）
+  * CPU 单测：调度器级（草稿获取 / 验证步记账 / 块预留 / 接受回写 / 统计）+ 全链路仿真（真实模型 + 真实 ModelRunner，确定性目标函数下 spec on/off 必须逐位一致；覆盖 chunked prefill / 混合批 / 抢占 / prefix cache）；全套 93 项全绿
+  * 贪心 A/B 门槛（`ab_spec_greedy.py`）：单序列 off/on 逐位一致（128 tokens）；3 序列：prompt 0 首个分歧 at 29，两侧决定行均为 4 路精确 bf16 tie（gap 0.0，min_gap ≤ 0.5 NEAR-TIE），分歧前无 argmax 早翻；prompts 1/2 逐位一致（含用草稿的情况）；on3b 跨进程重跑逐位一致 → ABG_PASS
+  * 多序列分歧根因（B2 实验）：bf16 近 tie 固有数值行为而非 bug——off 批形状本身无漂移（M=3 vs M=1 逐位一致）、KV 漂移自首个草稿命中起（移动前沿，旧位置永久一致）、根因行 4 路精确 tie（gap 0.0）、97 个 argmax 分歧全部 ≥ 分歧点（级联）
+  * 性能（`bench_spec.py`，8 并发 × 192 tok 贪心，随机 token prompt）：TPOT mean 30.75 → 23.31 ms（1.32×）、median 18.38 ms（1.67×）；TTFT 不变（100.3 ms）；接受率 0.958（852/889，231 spec 步）；聚合吞吐 257.1 → 193.1 tok/s（0.75×，wall 5.97 → 7.95 s）——批内任一带草稿即全批 varlen、小模型 decode 步太短摊不平验证开销、最慢序列（≈41 ms/token）决定 wall，如实记录；收益区间在大模型 / 低并发单流（decode 步长）
 
 性能数据（Qwen3-30B-A3B，W7900D，SDPA 兜底，单请求，prompt ≈ 10 token / 生成 64 token，贪心；
 MoE 数字来自 `bench_moe_ep.py`，best of 2 runs）：
@@ -336,6 +404,7 @@ MoE 数字来自 `bench_moe_ep.py`，best of 2 runs）：
 - [ ] W4 量化（加载 AWQ / GPTQ 离线量化 checkpoint，暂缓）
 - [x] 逐请求取消与停止串（stop strings）（服务层 stop 直通 + 断连自动取消 + GPU 阶段看门狗）
 - [x] MoE decode 性能优化（Triton grouped-GEMM 融合路径，EP=2 3.7 → 9.74 tok/s，约 2.6×）
+- [x] 投机解码（零训练 n-gram 草稿 + 验证步接受-拒绝，输出分布不变；贪心 A/B 一致性门槛 + 性能基准，见[投机解码](#投机解码)）
 - [ ] ROCm 加速：flash-attn ROCm 编译、CUDA graph 兼容性
 
 ## 来源与许可
