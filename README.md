@@ -19,6 +19,7 @@
 * 🧩 **Prefix caching** — 相同前缀跨请求共享，节省 prefill 计算
 * 🧮 **张量并行** — 支持 1–8 卡
 * 🧱 **专家并行（EP）** — MoE 专家切分到多卡，专家内 TP × EP 任意组合；decode 阶段 Triton grouped-GEMM 融合路径
+* 🪞 **DP（多副本）推理** — 进程级 D×TP 副本（各自独立 KV 池与调度器），父进程 round-robin 路由 + 同步 step 驱动，per-replica 看门狗 + 全局 fail-fast；`api_server --dp-size`
 * 🗜️ **权重量化（W8A16）** — `weight_bits=8` 加载时 int8 量化（per-group 128 对称），kernel 内反量化融合 GEMM；Qwen3-30B-A3B 57GB → 约 29GB，单张 48GB 卡跑 30B MoE
 * 🪃 **投机解码（n-gram 草稿）** — 零训练自历史 n-gram 草稿，验证步单次 forward 接受-拒绝，输出分布与目标严格一致；贪心 A/B 一致性门槛 + 性能基准
 * ⚡ **CUDA graph + torch.compile** — 捕获 decode 图，降低 launch 开销
@@ -267,6 +268,71 @@ decode 快路径被更慢的路径替代；② 0.6B 的 decode 步本身很短�
 1 个 token。投机解码的收益区间是 decode 步长的场景（大模型 / 低并发单流），小模型高并发
 恰是其最差配置。
 
+## DP（多副本）推理
+
+进程级多副本：把机器上的 GPU 分成 D 组，每组独立拉起一个完整的 LLMEngine 副本（独立进程组、独立 KV 块池、独立调度器）；父进程（`DPClient`）负责 round-robin 派发，并每轮给所有在途副本同步发 step（各副本 GPU forward 时间上重叠），每副本 reader 线程把 token 事件翻回调用方。副本内部仍可任意组合 TP × EP（MoE EP 通信沿用既有补零 all_reduce 方案）。
+
+```python
+from zvllm.engine.dp_engine import DPClient
+
+client = DPClient("Qwen/Qwen3-30B-A3B", dp_size=2, tensor_parallel_size=2,
+                  gpus=[2, 3, 4, 5], moe_ep_size=2, master_port=2345)
+client.generate(["..."])    # 与 LLMEngine 同构接口：add_request / generate / generate_stream / abort_request
+```
+
+服务层：`api_server.py --dp-size 2 --dp-gpus 2,3,4,5`，OpenAI 兼容接口不变（单引擎路径零改动）。
+
+设计要点：
+
+* **进程级隔离**：每副本先设 `CUDA_VISIBLE_DEVICES` 再建 LLM，进程组、NCCL 端口（master_port+r）、共享内存名（`{shm}_dp{r}`）天然错开；副本间不共享内存，单副本崩溃不污染其他副本状态。
+* **父进程路由 + 驱动**：driver 线程 round-robin 派发新请求，每轮同时给所有在途副本发 step；per-replica reader 线程做 seq_id→req_id 翻译，事件经 `on_event` 回推（锁外调用）。
+* **不变式**：每副本至多一个未回话 step（任何回话清零 outstanding）；seq→req 映射仅终态摘除（中间态误摘会丢事件，是实测修掉的第一 bug）；每请求末事件恒为 finished（skip/abort/fatal 均补发）。
+* **容错**：per-replica 看门狗（step_timeout 无回话 → 全局 fail-fast：拒新请求 + 在途请求快速失败 + `on_fatal` 回调）；api_server 将 fatal 转为 HTTP 503 并拒绝新请求。
+* **与 vLLM 的形态差异**：vLLM 的 DP attention 是"同进程内 DP"（一个模型实例，attention DP rank 间共享调度、专家 EP rank 间 all-to-all 换 token）；本实现是"进程级多副本"（每副本完整独立引擎，请求粒度 round-robin 路由，副本间零通信）。形态更简单、隔离更强（单副本崩溃不拖垮全局，看门狗 + fail-fast 可控），代价是每副本独立持有权重与 KV：无跨副本 prefix 共享、无 token 粒度负载均衡。
+
+### 性能（bench_dp.py）
+
+硬件与负载：4× W7900D 48GB（gfx1100，ROCm 7.1.1），Qwen3-30B-A3B（bf16），
+prompt 256 随机 token / 生成 128 token，N≥16，并发 C ∈ {1, 4, 16, 32, 64} 个 worker 线程，
+warmup 1 请求已排除，`enforce-eager`（SDPA 兜底、无 CUDA graph）；A 组 2026-08-20 13:25–13:40 测得，
+B 组 13:42 起补跑（约 14:00 完成），两组时间错开、非严格交错；A 组采于 DPClient daemon 修复之前，
+但 A 路径（独立 LLMEngine）不涉及该修复，数字不受影响。
+
+A = 单引擎 tp4×ep4（4 卡 1 个引擎，EP 更宽）；B = DP 2×tp2×ep2（2 副本，各自独立 KV 块池与调度器）：
+
+| 并发 C | 形态 | TTFT mean (ms) | TTFT p95 (ms) | TPOT mean (ms) | 吞吐 (tok/s) |
+|---|---|---|---|---|---|
+| 1 | A | 134.3 | 137.3 | 105.33 | 9.5 |
+| 1 | B | 204.5 | 393.6 | 101.99 | 9.7 |
+| 4 | A | 746.7 | 1181.0 | 105.34 | 36.2 |
+| 4 | B | 651.8 | 1353.3 | 108.26 | 34.6 |
+| 16 | A | 1522.5 | 1523.6 | 112.94 | 129.1 |
+| 16 | B | 2341.1 | 3258.3 | 122.11 | 111.2 |
+| 32 | A | 2341.0 | 2342.1 | 123.27 | 227.6 |
+| 32 | B | 2757.0 | 3680.5 | 132.04 | 204.8 |
+| 64 | A | 3647.2 | 4895.8 | 160.86 | 339.3 |
+| 64 | B | 3815.4 | 4599.3 | 143.29 | 365.2 |
+
+> vLLM 对比口径：vLLM 的 ROCm 官方支持仅覆盖 CDNA 系列，本机 gfx1100（RDNA3）无可行 vLLM 路径
+>（本机 vllm venv 实测 import 失败，阻塞证据已留档），故本章为同一代码库内两种并行形态的 A/B 对比
+> + 与 vLLM DP attention 的结构性差异说明，不呈现 vLLM 数字。
+
+**机制分析**
+
+* **低并发（C=1）**：B 的 TPOT 低 3.2%（102.0 vs 105.3 ms），但 TTFT mean 204.5 vs 134.3 ms 且分布更宽
+  （median 142.0 / p95 393.6，A 的 p95 为 137.3）：顺序请求下两副本交替 prefill，round-robin 派发与
+  per-replica 进程/通信开销未被摊薄。
+* **中并发（C=16/32）**：A 明显占优（吞吐 +16.1% / +11.1%）。两形态每 rank 的 MoE 计算量结构上相同
+  （T×topk/EP 恒定），差异在稠密部分：A 的集中批（16/32 序列）GEMM 算术强度更高，且 tp4 每 rank 读的
+  KV head 更少（2 vs 4）。
+* **高并发（C=64）**：B 反超（吞吐 +7.6%，TPOT −10.9%）。A 单引擎批到 64，步延迟 C=32→64 从
+  123.3→160.9 ms（+30.5%，B 仅 +8.5%），TTFT p95 4895.8 vs 4599.3——eager + SDPA 兜底（无 CUDA graph）
+  下逐层开销 ×48 放大了批与 4-rank all_reduce（流量为 B 的 2 倍）的代价；B 双调度器把批拆半、2-rank
+  通信、两副本 forward 时间重叠，步延迟增长更缓，交叉点落在 C=32–64。
+* **结论**：两形态总 KV 容量相同（A：4 卡分片池；B：2×2 卡独立池），高并发差异来自批拆分与通信形态
+  而非容量：C≤32 选单引擎宽 EP，逼近单引擎并发上限（C≥64）时 DP 拆分发力。两者互补，亦可叠加
+  （D×tp×ep 任意组合）。
+
 ## OpenAI 兼容服务
 
 ```bash
@@ -353,6 +419,13 @@ print(resp.choices[0].message.content)
   * 多序列分歧根因（B2 实验）：bf16 近 tie 固有数值行为而非 bug——off 批形状本身无漂移（M=3 vs M=1 逐位一致）、KV 漂移自首个草稿命中起（移动前沿，旧位置永久一致）、根因行 4 路精确 tie（gap 0.0）、97 个 argmax 分歧全部 ≥ 分歧点（级联）
   * 性能（`bench_spec.py`，8 并发 × 192 tok 贪心，随机 token prompt）：TPOT mean 30.75 → 23.31 ms（1.32×）、median 18.38 ms（1.67×）；TTFT 不变（100.3 ms）；接受率 0.958（852/889，231 spec 步）；聚合吞吐 257.1 → 193.1 tok/s（0.75×，wall 5.97 → 7.95 s）——批内任一带草稿即全批 varlen、小模型 decode 步太短摊不平验证开销、最慢序列（≈41 ms/token）决定 wall，如实记录；收益区间在大模型 / 低并发单流（decode 步长）
 
+* **DP 多副本（DP 2×tp2×ep2）**：2026-08-20，4× W7900D（GPU 2–5）+ Qwen3-30B-A3B bf16，`bench_dp.py` 5 并发点扫描
+  * C=64：吞吐 365.2 tok/s vs 单引擎 tp4×ep4 339.3（+7.6%），TPOT 143.3 vs 160.9 ms（−10.9%）；C≤32 单引擎占优
+    （C=16 +16.1% / C=32 +11.1%），交叉点 C=32–64，机制分析见 [DP（多副本）推理](#dp多副本推理)
+  * 实测发现并修复：daemon 副本无法 spawn TP rank 子进程（AssertionError）→ 改非 daemon + 父进程存活检查，
+    父死副本自退（防 SIGKILL 孤儿）；shm 名与同机既有服务冲突 → `--shm-name`
+  * tpot 自洽检查全过（per-req 重算 vs json 差 <0.5 ms）；CPU 101 测试全绿
+
 性能数据（Qwen3-30B-A3B，W7900D，SDPA 兜底，单请求，prompt ≈ 10 token / 生成 64 token，贪心；
 MoE 数字来自 `bench_moe_ep.py`，best of 2 runs）：
 
@@ -405,6 +478,7 @@ MoE 数字来自 `bench_moe_ep.py`，best of 2 runs）：
 - [x] 逐请求取消与停止串（stop strings）（服务层 stop 直通 + 断连自动取消 + GPU 阶段看门狗）
 - [x] MoE decode 性能优化（Triton grouped-GEMM 融合路径，EP=2 3.7 → 9.74 tok/s，约 2.6×）
 - [x] 投机解码（零训练 n-gram 草稿 + 验证步接受-拒绝，输出分布不变；贪心 A/B 一致性门槛 + 性能基准，见[投机解码](#投机解码)）
+- [x] DP 多副本推理（进程级 D×TP 副本 + round-robin 路由 + 同步 step + 看门狗 fail-fast；4 卡 30B-A3B A/B：C≤32 单引擎占优，C=64 DP 反超 +7.6%，见[DP（多副本）推理](#dp多副本推理)）
 - [ ] ROCm 加速：flash-attn ROCm 编译、CUDA graph 兼容性
 
 ## 来源与许可
