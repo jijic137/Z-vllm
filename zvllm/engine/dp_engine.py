@@ -17,6 +17,7 @@
 import atexit
 import threading
 import time
+import queue
 from collections import deque
 from dataclasses import dataclass, field
 from time import monotonic
@@ -26,6 +27,23 @@ from tqdm.auto import tqdm
 
 from zvllm.sampling_params import SamplingParams
 from zvllm.utils.model_download import resolve_model_path
+
+
+def _parent_alive(pid: int) -> bool:
+    """父进程是否存活（Linux 走 /proc；非 Linux 平台保守返回存活，不触发自退）。
+
+    用于副本进程的孤儿守护：父进程被 SIGKILL 等强杀时不会走到 close()，
+    副本需自行退出释放 GPU，而不是永远阻塞在 cmd_q.get() 上。"""
+    import os
+    if os.name != "posix":
+        return True
+    try:
+        os.stat(f"/proc/{pid}")
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
 
 
 def _load_tokenizer(path: str):
@@ -52,8 +70,15 @@ def _replica_main(cmd_q, out_q, model, gpus, master_port, shm_name, engine_kwarg
     out_q.put(("ready", engine.config.max_model_len, engine.config.num_kvcache_blocks))
     pending = 0
     req_to_seq = {}
+    parent_pid = os.getppid()
     while True:
-        cmd = cmd_q.get()
+        try:
+            cmd = cmd_q.get(timeout=5.0)
+        except queue.Empty:
+            # 超时窗口用于孤儿检测：父进程已死则自行退出（强杀场景不走 close）
+            if not _parent_alive(parent_pid):
+                break
+            continue
         op = cmd[0]
         try:
             if op == "add":
@@ -221,12 +246,17 @@ class DPClient:
         return ctx.Queue(), ctx.Queue()
 
     def _spawn_replica(self, r: int, cmd_q, out_q, gpus: list[int], master_port: int, shm_name: str):
-        """创建副本进程（默认 spawn 真实引擎；CPU 单测注入线程版假副本）。"""
+        """创建副本进程（默认 spawn 真实引擎；CPU 单测注入线程版假副本）。
+
+        副本必须非 daemon：副本内 LLMEngine 在 TP>1 时会再 spawn rank 子进程，
+        daemon 进程不允许有子进程（multiprocessing AssertionError）。
+        父进程被强杀时的孤儿副本由 _replica_main 的父进程存活守护兜底自退。
+        """
         ctx = mp.get_context("spawn")
         return ctx.Process(
             target=_replica_main,
             args=(cmd_q, out_q, self.model, gpus, master_port, shm_name, self.engine_kwargs),
-            name=f"zvllm-dp-replica-{r}", daemon=True)
+            name=f"zvllm-dp-replica-{r}", daemon=False)
 
     # ---------------------------------------------------------------- 对外接口
 
