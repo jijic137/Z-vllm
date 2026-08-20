@@ -21,6 +21,7 @@
 * 🧱 **专家并行（EP）** — MoE 专家切分到多卡，专家内 TP × EP 任意组合；decode 阶段 Triton grouped-GEMM 融合路径
 * 🪞 **DP（多副本）推理** — 进程级 D×TP 副本（各自独立 KV 池与调度器），父进程 round-robin 路由 + 同步 step 驱动，per-replica 看门狗 + 全局 fail-fast；`api_server --dp-size`
 * 🗜️ **权重量化（W8A16）** — `weight_bits=8` 加载时 int8 量化（per-group 128 对称），kernel 内反量化融合 GEMM；Qwen3-30B-A3B 57GB → 约 29GB，单张 48GB 卡跑 30B MoE
+* 🧊 **KV cache 量化（int8）** — `kv_bits=8` per-token 对称 int8 KV（kernel 内量化 + kernel 内反量化），同显存可分配约 2× KV 块；兼容 MoE/EP、投机解码、CUDA graph
 * 🪃 **投机解码（n-gram 草稿）** — 零训练自历史 n-gram 草稿，验证步单次 forward 接受-拒绝，输出分布与目标严格一致；贪心 A/B 一致性门槛 + 性能基准
 * ⚡ **CUDA graph + torch.compile** — 捕获 decode 图，降低 launch 开销
 * 🤖 **支持 Qwen3 / LLaMA / Qwen2 模型家族（稠密 + MoE）** — 如 Qwen3-0.6B、Qwen3-30B-A3B、Llama-3.2-1B、Qwen2-0.5B
@@ -178,6 +179,7 @@ for event in llm.generate(["Hello, Z-vLLM."], sampling_params, stream=True):
 | `tensor_parallel_size` | 1 | 张量并行卡数（1–8） |
 | `model_source` | "auto" | 非本地模型 ID 的权重来源：auto（魔搭优先→HF）/ modelscope / hf |
 | `weight_bits` | 16 | 权重量化：16（bf16，默认）/ 8（int8 加载时量化，per-group 128 对称，kernel 内反量化；int4 暂不支持） |
+| `kv_bits` | 16 | KV cache 精度：16（模型 dtype，默认）/ 8（int8，per-token 对称 scale，kernel 内反量化；int4 暂不支持） |
 | `spec_decode` | "off" | 投机解码：off（默认）/ ngram（零训练 n-gram 草稿） |
 | `spec_gamma` | 4 | 每步最多草稿 token 数（1–8，仅 ngram 生效） |
 | `spec_ngram` | 4 | n-gram 匹配长度（2–8，仅 ngram 生效） |
@@ -333,6 +335,33 @@ A = 单引擎 tp4×ep4（4 卡 1 个引擎，EP 更宽）；B = DP 2×tp2×ep2�
   而非容量：C≤32 选单引擎宽 EP，逼近单引擎并发上限（C≥64）时 DP 拆分发力。两者互补，亦可叠加
   （D×tp×ep 任意组合）。
 
+## KV cache 量化（KV int8）
+
+KV cache 是长上下文 / 高并发场景下显存的主要消耗者。`kv_bits=8` 将 K/V 以 int8 存储（per-token 对称
+scale：每 token 一个 fp32 scale，attention kernel 内即时反量化），同显存可分配约 2× KV 块，直接提升
+最大上下文长度与并发。int4 不支持。
+
+- **存储布局**：`kv_cache [2, L, nb, 256, Hkv, D]` int8 + `kv_scale [2, L, nb, 256]` fp32（per-token 对称
+  `scale = max(|x|)/127`）；每 rank 每块字节 `L×256×(2×Hkv×D + 8)`，约为 bf16 的一半。
+- **写路径**：prefill 与 decode 共用同一个 Triton `store_kvcache_int8` kernel（per-token 量化 + 写入
+  paged slot 一步完成，`-1` 无效 slot 跳过）。
+- **读路径**：decode 走自研 Triton paged-attention kernel（`triton_paged_decode`）——按 block_table
+  逐块 gather、kernel 内反量化、无 host 同步（graph 捕获友好）；bf16 cache 用同一 kernel 的 bf16 分支
+  （与 SDPA 兜底对拍位级一致）。prefill 正常读新算出的 bf16 K/V；prefix cache 命中 / 投机验证
+  （varlen）场景读缓存时 gather + kernel 内反量化（`sdpa_prefill` int8 分支；flash-attn 路径当前仅
+  服务 bf16 cache）。
+- **兼容性**：MoE/EP 多卡、投机解码（ngram）、prefix cache、CUDA graph 捕获均与 kv8 兼容（见[已验证](#已验证)）。
+
+用法：
+
+```python
+llm = LLM("Qwen/Qwen3-0.6B", kv_bits=8)   # 同显存 KV 块数 ≈ 2×
+```
+
+**诚实结论（质量）**：per-token 单 scale 粒度太粗——0.6B ΔPPL +2.62（相对 +10.6%），30B 贪心 A/B
+同样早分歧（见[已验证](#已验证)）。机制正确、显存收益真实，但当前版本只建议用于显存为主要约束、
+可接受一定质量损失的场景；改进方向是更细的 scale 粒度（per-head / per-channel）。
+
 ## OpenAI 兼容服务
 
 ```bash
@@ -426,6 +455,22 @@ print(resp.choices[0].message.content)
     父死副本自退（防 SIGKILL 孤儿）；shm 名与同机既有服务冲突 → `--shm-name`
   * tpot 自洽检查全过（per-req 重算 vs json 差 <0.5 ms）；CPU 101 测试全绿
 
+* **KV cache 量化（KV int8）**：2026-08-20，`kv_bits=8`（per-token 对称 int8，kernel 内量化 / kernel 内反量化；1× W7900D + 2× W7900D EP=2）
+  * kernel 对拍（`test_kv_gpu.py`，全 PASS）：`store_kvcache_int8` 与 fp32 参照位级一致（-1 slot 正确跳过）；
+    Triton paged decode int8 vs f64 朴素参照 rel 1.7e-3 / 1.5e-3（int8 量化噪声本身 9.2e-3）；
+    Triton paged decode bf16 vs f64 / SDPA rel 3.1e-4 / 2.9e-4；HIP graph 捕获 + replay 稳定
+  * 0.6B 单卡：kv_blocks 1502 → 2905（1.93×）；单流贪心 157.1 → 150.8 tok/s（−4%：0.6B decode 为
+    权重的带宽瓶颈而非 KV）
+  * PPL 自校验（350 token）：bf16 decode-KV vs 全精度 prefill Δ −0.10（噪声范围内）；
+    **ΔPPL(kv8 vs bf16) = +2.62（24.65 → 27.27，相对 +10.6%）**；贪心首分歧 1–13、token 一致率 4–16%
+    （int8 个别 prompt 出现退化重复）——per-token scale 粒度太粗，质量损失不可接受（如实记录）
+  * 30B-A3B EP=2：kv_blocks 1110 → 2174 /rank（1.96×）；35.8 vs 35.6 tok/s（1.00×，A3B decode 为
+    权重带宽瓶颈）；EP 多卡 + kv8 兼容 OK（无崩溃）；贪心 A/B 首分歧 67/128/5/39、token 一致率
+    52.3 / 100 / 6.2 / 32.8%
+  * 投机解码兼容：kv8 下 ngram on/off 单流 256 token 逐位一致（`spec_kv8_smoke.py`，验证 varlen int8 读路径）
+  * 结论：机制正确 + 显存收益真实（≈2× 块数），但 per-token 对称 scale 质量损失过大；改进方向
+    per-head / per-channel 更细 scale（见[KV cache 量化](#kv-cache-量化kv-int8)）
+
 性能数据（Qwen3-30B-A3B，W7900D，SDPA 兜底，单请求，prompt ≈ 10 token / 生成 64 token，贪心；
 MoE 数字来自 `bench_moe_ep.py`，best of 2 runs）：
 
@@ -479,6 +524,8 @@ MoE 数字来自 `bench_moe_ep.py`，best of 2 runs）：
 - [x] MoE decode 性能优化（Triton grouped-GEMM 融合路径，EP=2 3.7 → 9.74 tok/s，约 2.6×）
 - [x] 投机解码（零训练 n-gram 草稿 + 验证步接受-拒绝，输出分布不变；贪心 A/B 一致性门槛 + 性能基准，见[投机解码](#投机解码)）
 - [x] DP 多副本推理（进程级 D×TP 副本 + round-robin 路由 + 同步 step + 看门狗 fail-fast；4 卡 30B-A3B A/B：C≤32 单引擎占优，C=64 DP 反超 +7.6%，见[DP（多副本）推理](#dp多副本推理)）
+- [x] KV cache 量化 KV int8（per-token 对称 scale + Triton paged kernel 内反量化；kv_blocks 1.93–1.96×、吞吐中性；per-token 粒度质量损失大，改进方向更细 scale，见[已验证](#已验证)）
+- [ ] KV 量化更细 scale 粒度（per-head / per-channel int8）
 - [ ] ROCm 加速：flash-attn ROCm 编译、CUDA graph 兼容性
 
 ## 来源与许可

@@ -136,15 +136,28 @@ class ModelRunner:
             assert self.world_size % num_kv_heads == 0
             num_kv_heads = 1    # TP 超过 KV head 数：复制 KV head
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        kv_int8 = config.kv_bits == 8
+        if kv_int8:
+            # int8 per-token 量化：K/V 每元素 1 字节 + 每 token 1 个 fp32 scale（K、V 各一份）
+            block_bytes = hf_config.num_hidden_layers * self.block_size * (2 * num_kv_heads * head_dim + 8)
+        else:
+            block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        cache_dtype = torch.int8 if kv_int8 else hf_config.dtype
+        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size,
+                                    num_kv_heads, head_dim, dtype=cache_dtype)
+        if kv_int8:
+            self.kv_scale = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks,
+                                        self.block_size, dtype=torch.float32)
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
+                if kv_int8:
+                    module.k_scale = self.kv_scale[0, layer_id]
+                    module.v_scale = self.kv_scale[1, layer_id]
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):

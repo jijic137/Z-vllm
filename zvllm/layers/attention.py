@@ -45,6 +45,31 @@ if HAS_TRITON:
         tl.store(v_cache_ptr + cache_offsets, value)
 
 
+    @triton.jit
+    def store_kvcache_int8_kernel(
+        key_ptr, key_stride, value_ptr, value_stride,
+        k_cache_ptr, v_cache_ptr, k_scale_ptr, v_scale_ptr,
+        slot_mapping_ptr, D: tl.constexpr,
+    ):
+        """int8 KV 写路径：kernel 内 per-token 对称量化（max-abs / 127），写 int8 + fp32 per-token scale。"""
+        idx = tl.program_id(0)
+        slot = tl.load(slot_mapping_ptr + idx)
+        if slot == -1: return
+        key_offsets = idx * key_stride + tl.arange(0, D)
+        value_offsets = idx * value_stride + tl.arange(0, D)
+        key = tl.load(key_ptr + key_offsets).to(tl.float32)
+        value = tl.load(value_ptr + value_offsets).to(tl.float32)
+        k_scale = tl.maximum(tl.max(tl.abs(key), 0), 1e-8) / 127.0
+        v_scale = tl.maximum(tl.max(tl.abs(value), 0), 1e-8) / 127.0
+        k_q = tl.where(key >= 0, tl.floor(key / k_scale + 0.5), tl.ceil(key / k_scale - 0.5))
+        v_q = tl.where(value >= 0, tl.floor(value / v_scale + 0.5), tl.ceil(value / v_scale - 0.5))
+        cache_offsets = slot * D + tl.arange(0, D)
+        tl.store(k_cache_ptr + cache_offsets, tl.minimum(tl.maximum(k_q, -127.0), 127.0).to(tl.int8))
+        tl.store(v_cache_ptr + cache_offsets, tl.minimum(tl.maximum(v_q, -127.0), 127.0).to(tl.int8))
+        tl.store(k_scale_ptr + slot, k_scale)
+        tl.store(v_scale_ptr + slot, v_scale)
+
+
 def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping: torch.Tensor):
     assert HAS_TRITON, "store_kvcache requires triton"
     N, num_heads, head_dim = key.shape
@@ -56,19 +81,43 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
     store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
 
 
+def store_kvcache_int8(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor,
+                       k_scale_cache: torch.Tensor, v_scale_cache: torch.Tensor, slot_mapping: torch.Tensor):
+    assert HAS_TRITON, "store_kvcache_int8 requires triton"
+    N, num_heads, head_dim = key.shape
+    D = num_heads * head_dim
+    assert key.stride(-1) == 1 and value.stride(-1) == 1
+    assert key.stride(1) == head_dim and value.stride(1) == head_dim
+    assert k_cache.stride(1) == D and v_cache.stride(1) == D
+    assert k_cache.dtype == torch.int8 and v_cache.dtype == torch.int8
+    assert k_scale_cache.dtype == torch.float32 and v_scale_cache.dtype == torch.float32
+    assert slot_mapping.numel() == N
+    store_kvcache_int8_kernel[(N,)](key, key.stride(0), value, value.stride(0),
+                                    k_cache, v_cache, k_scale_cache, v_scale_cache, slot_mapping, D)
+
+
 def _repeat_kv(t: torch.Tensor, ratio: int, dim: int) -> torch.Tensor:
     """GQA：KV head 从 Hkv 扩展到 H"""
     return t if ratio == 1 else t.repeat_interleave(ratio, dim=dim)
 
 
-def _gather_context(block_ids: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, total_len: int, block_size: int):
-    """从分页缓存按 block 表 gather 出完整上下文 K/V，token-major [total_len, Hkv, D]"""
+def _gather_context(block_ids: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, total_len: int, block_size: int,
+                    k_scale_cache: torch.Tensor | None = None, v_scale_cache: torch.Tensor | None = None,
+                    out_dtype: torch.dtype | None = None):
+    """从分页缓存按 block 表 gather 出完整上下文 K/V，token-major [total_len, Hkv, D]。
+    int8 缓存：同步 gather per-token scale 并反量化到 out_dtype（缺省 bf16）后返回。"""
     device = block_ids.device
     idx = (block_ids.to(torch.int64)[:, None] * block_size
            + torch.arange(block_size, device=device, dtype=torch.int64)).reshape(-1)[:total_len]
     Hkv, D = k_cache.size(2), k_cache.size(3)
     k = k_cache.view(k_cache.size(0) * block_size, Hkv, D)[idx]
     v = v_cache.view(v_cache.size(0) * block_size, Hkv, D)[idx]
+    if k_scale_cache is not None:
+        dtype = out_dtype or torch.bfloat16
+        ks = k_scale_cache.view(k_scale_cache.size(0) * block_size)[idx].to(dtype)
+        vs = v_scale_cache.view(v_scale_cache.size(0) * block_size)[idx].to(dtype)
+        k = k.to(dtype) * ks[:, None, None]
+        v = v.to(dtype) * vs[:, None, None]
     return k, v
 
 
@@ -76,7 +125,8 @@ def sdpa_prefill(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                  cu_seqlens_q: torch.Tensor, cu_seqlens_k: torch.Tensor,
                  block_size: int, k_cache: torch.Tensor | None, v_cache: torch.Tensor | None,
                  block_tables: torch.Tensor | None,
-                 num_heads: int, num_kv_heads: int, scale: float) -> torch.Tensor:
+                 num_heads: int, num_kv_heads: int, scale: float,
+                 k_scale_cache: torch.Tensor | None = None, v_scale_cache: torch.Tensor | None = None) -> torch.Tensor:
     """prefill 阶段 SDPA 兜底（等价 flash_attn_varlen_func）。纯张量运算，CPU/GPU 通用。
     block_tables 为 None：所有序列无 prefix，直接用新算出的 k/v；
     否则从分页缓存 gather 完整上下文（新 token 已由 store_kvcache 写入缓存）。
@@ -99,7 +149,8 @@ def sdpa_prefill(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
             o_i = F.scaled_dot_product_attention(q_i, k_i, v_i, is_causal=True, scale=scale)
         else:
             k_full, v_full = _gather_context(block_tables[i, :(Lk + block_size - 1) // block_size],
-                                             k_cache, v_cache, Lk, block_size)
+                                             k_cache, v_cache, Lk, block_size,
+                                             k_scale_cache, v_scale_cache, q.dtype)
             k_full = _repeat_kv(k_full, ratio, 1).unsqueeze(0).transpose(1, 2)
             v_full = _repeat_kv(v_full, ratio, 1).unsqueeze(0).transpose(1, 2)
             rows = torch.arange(Lq, device=device)[:, None]
@@ -138,6 +189,110 @@ def sdpa_decode(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor,
     return o.permute(0, 2, 1, 3)                                                          # [bs, 1, H, D]
 
 
+if HAS_TRITON:
+
+    @triton.jit
+    def paged_decode_attn_kernel(
+        q_ptr, k_cache_ptr, v_cache_ptr, k_scale_ptr, v_scale_ptr, out_ptr,
+        context_lens_ptr, block_tables_ptr, bt_stride,
+        softmax_scale,
+        H: tl.constexpr, Hkv: tl.constexpr, D: tl.constexpr, BS: tl.constexpr,
+        IS_INT8: tl.constexpr,
+    ):
+        """Triton paged decode attention：每 (batch, q-head) 一个 program，online softmax，
+        按 block 表直读 K/V，无 host 同步（兼容 CUDA Graph 捕获）。
+        IS_INT8：读 int8 + fp32 per-token scale，kernel 内反量化；否则直读模型 dtype
+        （与 sdpa_decode 数值等价，且无 Lmax 同步）。
+        q: [bs, H, D] contiguous；k/v_cache: [nb, BS, Hkv, D]；scale: [nb, BS]；out: [bs, H, D] f32。"""
+        pid = tl.program_id(0)
+        b = pid // H
+        h = pid % H
+        hkv = h // (H // Hkv)
+        L = tl.load(context_lens_ptr + b)
+        offs_d = tl.arange(0, D)
+        q = tl.load(q_ptr + pid * D + offs_d).to(tl.float32)
+        offs_d64 = offs_d.to(tl.int64)
+        m_i = float("-inf")
+        l_i = 0.0
+        acc = tl.zeros([D], tl.float32)
+        qk_scale = softmax_scale * 1.4426950408889634    # log2(e)
+        kv_block_stride = BS * Hkv * D
+        for blk in range(0, L // BS):
+            bt = tl.load(block_tables_ptr + b * bt_stride + blk).to(tl.int64)
+            base = bt * kv_block_stride + hkv * D
+            offs_t = tl.arange(0, BS)    # 块内局部偏移：逻辑块的 token 总在物理块 0..BS-1
+            k_offs = base + offs_t[:, None].to(tl.int64) * (Hkv * D) + offs_d64[None, :]
+            k = tl.load(k_cache_ptr + k_offs)
+            if IS_INT8:
+                k = k.to(tl.float32) * tl.load(k_scale_ptr + bt * BS + offs_t.to(tl.int64))[:, None]
+            else:
+                k = k.to(tl.float32)
+            s = tl.sum(k * q[None, :], axis=1) * qk_scale
+            m_new = tl.maximum(m_i, tl.max(s, 0))
+            p = tl.math.exp2(s - m_new)
+            alpha = tl.math.exp2(m_i - m_new)
+            l_i = l_i * alpha + tl.sum(p, 0)
+            v = tl.load(v_cache_ptr + k_offs)
+            if IS_INT8:
+                v = v.to(tl.float32) * tl.load(v_scale_ptr + bt * BS + offs_t.to(tl.int64))[:, None]
+            else:
+                v = v.to(tl.float32)
+            acc = acc * alpha + tl.sum(v * p[:, None], axis=0)
+            m_i = m_new
+        tail = L - (L // BS) * BS
+        if tail > 0:
+            blk = L // BS
+            bt = tl.load(block_tables_ptr + b * bt_stride + blk).to(tl.int64)
+            base = bt * kv_block_stride + hkv * D
+            offs_t = tl.arange(0, BS)    # 块内局部偏移
+            valid = offs_t < tail
+            k_offs = base + offs_t[:, None].to(tl.int64) * (Hkv * D) + offs_d64[None, :]
+            k = tl.load(k_cache_ptr + k_offs, mask=valid[:, None], other=0.0)
+            if IS_INT8:
+                k = k.to(tl.float32) * tl.load(k_scale_ptr + bt * BS + offs_t.to(tl.int64),
+                                               mask=valid, other=0.0)[:, None]
+            else:
+                k = k.to(tl.float32)
+            s = tl.sum(k * q[None, :], axis=1) * qk_scale
+            s = tl.where(valid, s, float("-inf"))
+            m_new = tl.maximum(m_i, tl.max(s, 0))
+            p = tl.math.exp2(s - m_new)
+            alpha = tl.math.exp2(m_i - m_new)
+            l_i = l_i * alpha + tl.sum(p, 0)
+            v = tl.load(v_cache_ptr + k_offs, mask=valid[:, None], other=0.0)
+            if IS_INT8:
+                v = v.to(tl.float32) * tl.load(v_scale_ptr + bt * BS + offs_t.to(tl.int64),
+                                               mask=valid, other=0.0)[:, None]
+            else:
+                v = v.to(tl.float32)
+            acc = acc * alpha + tl.sum(v * p[:, None], axis=0)
+        out = acc / l_i
+        tl.store(out_ptr + pid * D + offs_d, out)
+
+
+def triton_paged_decode(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor,
+                        k_scale_cache: torch.Tensor, v_scale_cache: torch.Tensor,
+                        context_lens: torch.Tensor, block_tables: torch.Tensor,
+                        num_heads: int, num_kv_heads: int, scale: float) -> torch.Tensor:
+    """Triton paged decode attention（按缓存 dtype 自动 int8 直读 / bf16）。
+    返回 [bs, 1, H, D]（与 sdpa_decode 同形状）；无 host 同步，兼容 CUDA Graph 捕获。"""
+    assert HAS_TRITON, "triton_paged_decode requires triton"
+    bs, H, D = q.shape
+    BS = k_cache.size(1)
+    assert q.is_contiguous(), "triton_paged_decode requires contiguous q"
+    out = torch.empty(bs * H * D, dtype=torch.float32, device=q.device)
+    is_int8 = k_cache.dtype == torch.int8
+    paged_decode_attn_kernel[(bs * H,)](
+        q, k_cache, v_cache,
+        k_scale_cache if is_int8 else q,    # bf16 分支不读 scale 指针，占位即可
+        v_scale_cache if is_int8 else q,
+        out, context_lens, block_tables, block_tables.stride(0),
+        scale, H, num_kv_heads, D, BS, is_int8,
+        num_warps=4,
+    )
+    return out.view(bs, 1, H, D).to(q.dtype)
+
+
 class Attention(nn.Module):
 
     def __init__(
@@ -153,31 +308,43 @@ class Attention(nn.Module):
         self.scale = scale
         self.num_kv_heads = num_kv_heads
         self.k_cache = self.v_cache = torch.tensor([])
+        self.k_scale = self.v_scale = torch.tensor([])    # int8 KV 的 per-token scale [nb, BS]（bf16 时为空）
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
+        is_int8 = bool(k_cache.numel() and k_cache.dtype == torch.int8)
         if k_cache.numel() and v_cache.numel():
-            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+            if is_int8:
+                store_kvcache_int8(k, v, k_cache, v_cache, self.k_scale, self.v_scale, context.slot_mapping)
+            else:
+                store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_prefill:
-            if HAS_FLASH_ATTN:
+            if HAS_FLASH_ATTN and not is_int8:
                 if context.block_tables is not None:    # prefix cache
                     k, v = k_cache, v_cache
                 o = flash_attn_varlen_func(q, k, v,
                                            max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
                                            max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
                                            softmax_scale=self.scale, causal=True, block_table=context.block_tables)
-            else:    # SDPA 兜底（ROCm 等无 flash-attn 环境）
+            else:    # SDPA 兜底（ROCm 等无 flash-attn 环境；int8 KV 需 gather 反量化）
                 o = sdpa_prefill(q, k, v, context.cu_seqlens_q, context.cu_seqlens_k,
                                  k_cache.size(1) if k_cache.numel() else 0,
                                  k_cache, v_cache, context.block_tables,
-                                 self.num_heads, self.num_kv_heads, self.scale)
+                                 self.num_heads, self.num_kv_heads, self.scale,
+                                 self.k_scale if is_int8 else None,
+                                 self.v_scale if is_int8 else None)
         else:    # decode
-            if HAS_FLASH_ATTN:
+            if is_int8 or (HAS_TRITON and not HAS_FLASH_ATTN):
+                # Triton paged decode：无 host 同步（graph 友好）；ROCm 无 flash-attn 时亦替换 SDPA 兜底
+                o = triton_paged_decode(q, k_cache, v_cache, self.k_scale, self.v_scale,
+                                        context.context_lens, context.block_tables,
+                                        self.num_heads, self.num_kv_heads, self.scale)
+            elif HAS_FLASH_ATTN:
                 o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
                                             cache_seqlens=context.context_lens, block_table=context.block_tables,
                                             softmax_scale=self.scale, causal=True)
-            else:    # SDPA 兜底（ROCm 等无 flash-attn 环境）
+            else:    # SDPA 兜底（CPU 单测环境）
                 o = sdpa_decode(q, k_cache, v_cache, context.context_lens, context.block_tables,
                                 k_cache.size(1), self.num_heads, self.num_kv_heads, self.scale)
         return o

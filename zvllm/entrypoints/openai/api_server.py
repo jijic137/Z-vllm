@@ -527,6 +527,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--enforce-eager", action="store_true", help="禁用 CUDA Graph（MoE 会自动强制）")
     p.add_argument("--weight-bits", type=int, default=16,
                    help="权重点数：16=bf16（默认）；8=int8 加载时量化（per-group 128 对称，不支持 int4）")
+    p.add_argument("--kv-bits", type=int, default=16,
+                   help="KV cache 精度：16=模型 dtype（默认）；8=int8 per-token 量化（不支持 int4）")
     return p.parse_args()
 
 
@@ -551,6 +553,7 @@ def main():
         shm_size=args.shm_size,
         enforce_eager=args.enforce_eager,
         weight_bits=args.weight_bits,
+        kv_bits=args.kv_bits,
     )
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
     print(f"Loading model {args.model} ...")
