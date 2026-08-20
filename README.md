@@ -24,6 +24,7 @@
 * 🎲 **完整采样** — 贪心（temperature=0）、top-k、top-p、seed 可复现
 * 📡 **流式输出** — `generate(..., stream=True)` 逐 token 产出事件
 * 🔌 **OpenAI 兼容服务** — FastAPI + SSE，`/v1/chat/completions`、`/v1/completions` 直接对接 OpenAI SDK
+* 🛑 **stop 与逐请求取消** — `stop` 停止串直通；流式请求客户端断连自动取消并释放 KV 块；GPU 阶段看门狗防服务 wedged
 
 ## 项目结构
 
@@ -221,7 +222,7 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
-`stop` / `presence_penalty` / `frequency_penalty` 等 OpenAI 字段被接受但暂不生效。
+`stop` 已支持：生成文本以任一停止串结尾即终止（`finish_reason="stop"`，停止串保留在输出中）。`presence_penalty` / `frequency_penalty` 被接受但暂不生效。流式请求客户端断连时自动取消对应序列并释放其 KV 块（服务日志出现 `aborted seq N`）。单步 GPU 阶段超过 60 s 看门狗超时时，在途请求快速失败、进程退出，交由上层重启。
 
 ## Benchmark
 
@@ -257,6 +258,9 @@ print(resp.choices[0].message.content)
   * Qwen3-0.6B 回归：≈67 tok/s（此前验证区间 35–69），模型分发 / RMSNorm 改动无回归
   * CPU 单测：llama / qwen2 配置解析（eps / rope_theta 流通过）、权重加载布局、全 forward 对拍朴素参考
     （max_diff 4.29e-6 / 6.56e-6）、tied embeddings、model_type 分发
+* **OpenAI 服务真机 e2e**：2026-08-20，1× W7900D + Qwen2-0.5B（魔搭权重）——stop 流正常收尾
+  （`finish_reason="stop"` + `[DONE]`）；客户端 3 s 后断连 → 服务日志出现 `aborted seq`（序列取消、KV 释放）；
+  服务保持健康，后续请求正常
 * **MoE 专家并行（EP）**：Qwen3-30B-A3B（128 专家 / 48 层全 MoE / bf16）
   * TP=2 / 4 / 8 均端到端跑通；纯 EP（`moe_ep_size=N`）与专家内 TP（`moe_ep_size=1`）均正确生成
   * CPU 单测：EP 路径 MoE 前向与逐 token 参照一致（bf16，max_diff 0.0）；
@@ -319,7 +323,7 @@ MoE 数字来自 `bench_moe_ep.py`，best of 2 runs）：
 
 - [x] 支持更多模型家族（LLaMA、Qwen2 等）（llama.py 同构共用实现 + model_type 注册分发，Qwen2-0.5B / Llama-3.2-1B 真机验证）
 - [ ] 权重量化支持（AWQ / GPTQ）
-- [ ] 逐请求取消与停止串（stop strings）
+- [x] 逐请求取消与停止串（stop strings）（服务层 stop 直通 + 断连自动取消 + GPU 阶段看门狗）
 - [x] MoE decode 性能优化（Triton grouped-GEMM 融合路径，EP=2 3.7 → 9.74 tok/s，约 2.6×）
 - [ ] ROCm 加速：flash-attn ROCm 编译、CUDA graph 兼容性
 
