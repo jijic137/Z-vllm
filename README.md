@@ -19,6 +19,7 @@
 * 🧩 **Prefix caching** — 相同前缀跨请求共享，节省 prefill 计算
 * 🧮 **张量并行** — 支持 1–8 卡
 * 🧱 **专家并行（EP）** — MoE 专家切分到多卡，专家内 TP × EP 任意组合；decode 阶段 Triton grouped-GEMM 融合路径
+* 🗜️ **权重量化（W8A16）** — `weight_bits=8` 加载时 int8 量化（per-group 128 对称），kernel 内反量化融合 GEMM；Qwen3-30B-A3B 57GB → 约 29GB，单张 48GB 卡跑 30B MoE
 * ⚡ **CUDA graph + torch.compile** — 捕获 decode 图，降低 launch 开销
 * 🤖 **支持 Qwen3 / LLaMA / Qwen2 模型家族（稠密 + MoE）** — 如 Qwen3-0.6B、Qwen3-30B-A3B、Llama-3.2-1B、Qwen2-0.5B
 * 🎲 **完整采样** — 贪心（temperature=0）、top-k、top-p、seed 可复现
@@ -173,6 +174,7 @@ for event in llm.generate(["Hello, Z-vLLM."], sampling_params, stream=True):
 | `gpu_memory_utilization` | 0.9 | KV cache 可占用的显存比例 |
 | `tensor_parallel_size` | 1 | 张量并行卡数（1–8） |
 | `model_source` | "auto" | 非本地模型 ID 的权重来源：auto（魔搭优先→HF）/ modelscope / hf |
+| `weight_bits` | 16 | 权重量化：16（bf16，默认）/ 8（int8 加载时量化，per-group 128 对称，kernel 内反量化；int4 暂不支持） |
 | `enforce_eager` | False | True 时禁用 CUDA graph |
 | `kvcache_block_size` | 256 | 每个 KV 块的 token 数（须为 256 的倍数） |
 | `moe_tp_size` | 自动推导 | MoE 专家内 TP 卡数；缺省 = 卡数 / `moe_ep_size`（即纯 EP），显式指定可组合混合 TP×EP |
@@ -221,6 +223,8 @@ resp = client.chat.completions.create(
 )
 print(resp.choices[0].message.content)
 ```
+
+命令行参数与引擎参数一一对应（见[主要参数](#主要参数)），如 `--weight-bits 8` 启动 int8 量化模型。
 
 `stop` 已支持：生成文本以任一停止串结尾即终止（`finish_reason="stop"`，停止串保留在输出中）。`presence_penalty` / `frequency_penalty` 被接受但暂不生效。流式请求客户端断连时自动取消对应序列并释放其 KV 块（服务日志出现 `aborted seq N`）。单步 GPU 阶段超过 60 s 看门狗超时时，在途请求快速失败、进程退出，交由上层重启。
 
@@ -274,6 +278,12 @@ print(resp.choices[0].message.content)
   * 并发 decode 扫描（`bench_moe_conc.py`）：1/16/32/64 请求 × EP=2/4/8，
     聚合吞吐随 N 近线性（每翻倍 ≈1.93–1.99×），峰值 587.79 tok/s（EP=8，N=64）；
     T=1 平台期在高并发下被击穿，EP=8 反超（N=64 时 +10.8%）
+* **权重量化（W8A16）**：2026-08-20，`weight_bits=8`（加载时 int8，per-group 128 对称，kernel 内反量化；embed/lm_head 保持 bf16）
+  * 每卡纯权重显存（loader 级实测，不含 KV cache）：Qwen3-30B-A3B EP=2，bf16 28.5 GiB → W8 14.8 GiB（−48%）
+  * **单张 48GB 卡跑 30B MoE**：W8 TP=1 权重 29.5 GiB + KV cache，单流贪心 30.7 tok/s、输出连贯（bf16 57GB 单卡放不下，至少 2 卡）
+  * 精度：Qwen3-0.6B ΔPPL +0.0845（≤ 0.1）；30B 贪心 A/B（W8 vs bf16）主体一致、仅量化噪声级分歧
+  * kernel 对拍：稠密 `quant_linear` 相对误差 ≤ 2.1e-3（vs 物化反量化 mm）；MoE Triton QUANT_W 分支与 bf16 分支位级一致（max_diff 0.0）
+  * 速度（30B-A3B，4 prompt × 64 token 混合）：EP=2 W8 26.0 vs bf16 32.7 tok/s（小批量反量化开销，如实记录）；单卡 W8 30.7 tok/s
 
 性能数据（Qwen3-30B-A3B，W7900D，SDPA 兜底，单请求，prompt ≈ 10 token / 生成 64 token，贪心；
 MoE 数字来自 `bench_moe_ep.py`，best of 2 runs）：
@@ -322,7 +332,8 @@ MoE 数字来自 `bench_moe_ep.py`，best of 2 runs）：
 ## Roadmap
 
 - [x] 支持更多模型家族（LLaMA、Qwen2 等）（llama.py 同构共用实现 + model_type 注册分发，Qwen2-0.5B / Llama-3.2-1B 真机验证）
-- [ ] 权重量化支持（AWQ / GPTQ）
+- [x] 权重量化 W8A16（加载时 int8 per-group 128 + kernel 内反量化 GEMM；30B-A3B 每卡权重显存 28.5 → 14.8 GiB，单张 48GB 卡跑 30B MoE，见[已验证](#已验证)）
+- [ ] W4 量化（加载 AWQ / GPTQ 离线量化 checkpoint，暂缓）
 - [x] 逐请求取消与停止串（stop strings）（服务层 stop 直通 + 断连自动取消 + GPU 阶段看门狗）
 - [x] MoE decode 性能优化（Triton grouped-GEMM 融合路径，EP=2 3.7 → 9.74 tok/s，约 2.6×）
 - [ ] ROCm 加速：flash-attn ROCm 编译、CUDA graph 兼容性
