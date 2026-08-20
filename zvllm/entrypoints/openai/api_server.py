@@ -22,10 +22,16 @@
 1. 两阶段 step：step loop 只在阶段 A（调度）与阶段 C（状态回写）持服务锁，
    GPU 计算（阶段 B）不持锁——请求入队/取消永远不会被 GPU 计算阻塞。
 2. 断连检测：uvicorn 在客户端断连时既不取消响应任务、send 也不报错，
-   流式响应必须与 ASGI disconnect 消息（Request.is_disconnected）竞速；
-   检测到断连立即取消对应序列（finish_reason="abort"）并释放其 KV 块，
-   避免"孤儿序列"继续空转到 max_tokens。非流式请求的客户端断连暂不检测
-   （请求会继续生成完）。
+   断连只能经 ASGI receive 通道上的 http.disconnect 消息感知。实际触发
+   链路（真机验证）：客户端 FIN/RST → uvicorn h11 置连接断连状态并发
+   消息（Python 3.12 asyncio 下裸 FIN 也会触发 transport 关闭，可靠捕获）
+   → starlette StreamingResponse 内置 listen_for_disconnect 取消响应任务
+   （本文件另有独立 task 轮询 is_disconnected() 双保险）→ 流式生成器
+   finally 触发 abort：取消对应序列（finish_reason="abort"）并释放其 KV
+   块，避免"孤儿序列"继续空转到 max_tokens。非流式请求的客户端断连暂不
+   检测（请求会继续生成完）。注意：守护运行时 stdout 必须行缓冲（见
+   main）——重定向到文件时 stdout 默认块缓冲，abort 日志可能滞留缓冲区，
+   进程被 kill 时丢失，造成"断连未触发取消"的假象。
 3. 看门狗：单步 GPU 阶段超过 STEP_TIMEOUT 未返回（如 GPU kernel 挂死）时，
    挂死 kernel 无法在进程内取消（torch 无进程内 reset），看门狗先通知全部
    在途请求快速失败，再退出进程，交由上层（systemd/手动）重启恢复，
@@ -38,6 +44,7 @@ import argparse
 import asyncio
 import json
 import os
+import sys
 import threading
 import time
 import uuid
@@ -262,12 +269,15 @@ def _sampling_params(req) -> SamplingParams:
 
 
 async def _wait_disconnect(request: Request) -> None:
-    """等待客户端断连（已断连则立即返回）。
+    """等待客户端断连（已断连则立即返回）。双保险路径之一。
 
-    uvicorn 在客户端断连时既不取消响应任务、对已断连连接的 send 也不报错——
-    唯一可靠的检测是等待 ASGI receive 通道上的 http.disconnect 消息
-    （Request.is_disconnected 等的就是这条消息，会阻塞到客户端断连为止）。
-    该协程应运行在独立 task 里与 token 流竞速。"""
+    uvicorn 在客户端断连时既不取消响应任务、对已断连连接的 send 也不报错。
+    感知断连的唯一来源是 ASGI receive 通道上的 http.disconnect 消息：客户端
+    FIN/RST 时由 uvicorn h11 发出（Python 3.12 asyncio 下裸 FIN 同样可靠触发
+    ——eof_received 返回 None 时 asyncio 自动关闭 transport）。
+    starlette 的 StreamingResponse 自带一个阻塞式 listen_for_disconnect，断连
+    时会取消响应任务；本协程是独立的轮询副本，两者竞速取先到。该协程必须
+    运行在独立 task 里与 token 流竞速。"""
     while True:
         if await request.is_disconnected():
             return
@@ -433,6 +443,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def main():
+    # stdout 重定向到文件时默认块缓冲（8KB），abort 等诊断 print 会滞留
+    # 缓冲区，进程被 kill 时丢失——改为行缓冲保证日志实时落盘。
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
     args = parse_args()
     kwargs = dict(
         tensor_parallel_size=args.tensor_parallel_size,
