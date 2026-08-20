@@ -6,7 +6,7 @@
 /v1/completions（多 prompt 非流式、流式仅单 prompt）、非法参数 422/400。
 """
 import json
-import queue
+import asyncio
 import sys
 import threading
 from types import SimpleNamespace
@@ -44,7 +44,11 @@ class FakeEngine:
     与真实引擎一致：step 只为已 add 的序列产出输出（调度器不认识未 add 的
     序列），is_finished 取决于是否还有未结束序列。每个 step 为每条已 add
     且未结束的序列产出一个新 token，token 列表耗尽即结束。状态加锁，模拟
-    真实并发（后台 step 线程 + 请求处理线程）。
+    真实并发（后台 step 线程 + 事件循环）。
+
+    三阶段接口与真实引擎对应：schedule（阶段 A，列队列）/ run_model
+    （阶段 B，只"采样"不推进状态）/ finalize_step（阶段 C，推进状态并产出
+    输出）；阶段 B 期间被取消（不在 _open 中）的序列在阶段 C 被跳过。
     """
 
     def __init__(self, specs):
@@ -84,22 +88,29 @@ class FakeEngine:
                 return True
             return False
 
-    def step(self):
+    def schedule(self):
+        with self._lock:
+            return [FakeSeq(i) for i in sorted(self._open)], False
+
+    def run_model(self, seqs, is_prefill):
+        with self._lock:
+            return [self._open[s.seq_id]["tokens"][self._open[s.seq_id]["pos"]]
+                    for s in seqs]
+
+    def finalize_step(self, seqs, is_prefill, token_ids):
         with self._lock:
             outputs = []
-            for seq_id in sorted(self._open):
-                st = self._open[seq_id]
-                if st["pos"] >= len(st["tokens"]):
-                    continue
-                tok = st["tokens"][st["pos"]]
+            for s, tok in zip(seqs, token_ids):
+                st = self._open.get(s.seq_id)
+                if st is None:
+                    continue    # 阶段 B 期间被取消：状态已定型，跳过
                 st["pos"] += 1
                 finished = st["pos"] >= len(st["tokens"])
-                outputs.append((seq_id, [tok], finished,
+                if finished:
+                    del self._open[s.seq_id]
+                outputs.append((s.seq_id, [tok], finished,
                                 st["reason"] if finished else None))
-            for seq_id in [s for s, st in self._open.items()
-                           if st["pos"] >= len(st["tokens"])]:
-                del self._open[seq_id]
-            return outputs, 1
+            return outputs
 
 
 def parse_sse(lines):
@@ -223,30 +234,35 @@ def test_stop_param_passthrough():
     print("test_stop_param_passthrough OK")
 
 
-def test_iter_stream_aborts_on_abandon():
-    # 客户端放弃流（生成器被 close，如断连）时应触发 abort_request 并注销队列。
+def test_astream_aborts_on_abandon():
+    # 客户端放弃流（astream 被 aclose，如断连）时应触发 abort_request 并注销队列。
     # 后台 step 线程会紧循环重入服务锁，可能把测试线程的锁等待饿死到序列跑完
     #（非公平锁 + 忙循环，属测试环境假象；真实推理每步是 GPU 临界区，且断连
     # 时序列尚有大量 token 在途），故这里先停掉 step 线程，再手动登记在途序列
-    # 并预置事件队列，使断言确定。step loop 与真实并发的交互由上方 HTTP 测试覆盖。
+    # 并预置事件队列，使断言确定。step loop 与真实并发的交互由上方 HTTP 测试
+    # 与真机 e2e 覆盖。
     engine = FakeEngine([])
     server = InferenceServer(engine)
     server.shutdown()
     server.step_thread.join(timeout=5)
     assert not server.step_thread.is_alive(), "step 线程应已退出"
-    seq_id = 1
-    engine._open[seq_id] = {"pos": 0, "tokens": [10, 11, 12], "reason": "stop"}
-    q = queue.Queue()
-    server.queues[seq_id] = q
-    q.put(([10], False, None))   # 预置第一个 token 事件
-    gen = server.iter_stream(seq_id)
-    item = next(gen)
-    assert item == ([10], False, None)
-    gen.close()   # 模拟客户端断连
-    assert engine.aborted == [seq_id], "放弃流应触发 abort_request"
-    assert seq_id not in server.queues
-    assert seq_id not in engine._open, "被取消的序列应移出引擎"
-    print("test_iter_stream_aborts_on_abandon OK")
+
+    async def scenario():
+        seq_id = 1
+        engine._open[seq_id] = {"pos": 0, "tokens": [10, 11, 12], "reason": "stop"}
+        q = asyncio.Queue()
+        server.queues[seq_id] = q
+        q.put_nowait(([10], False, None))   # 预置第一个 token 事件
+        gen = server.astream(seq_id)
+        item = await gen.__anext__()
+        assert item == ([10], False, None)
+        await gen.aclose()   # 模拟客户端断连
+        assert engine.aborted == [seq_id], "放弃流应触发 abort_request"
+        assert seq_id not in server.queues
+        assert seq_id not in engine._open, "被取消的序列应移出引擎"
+
+    asyncio.run(scenario())
+    print("test_astream_aborts_on_abandon OK")
 
 
 if __name__ == "__main__":
@@ -257,5 +273,5 @@ if __name__ == "__main__":
     test_completions_stream_multi_prompt_rejected()
     test_invalid_sampling_params_rejected()
     test_stop_param_passthrough()
-    test_iter_stream_aborts_on_abandon()
+    test_astream_aborts_on_abandon()
     print("ALL API SERVER TESTS PASSED")

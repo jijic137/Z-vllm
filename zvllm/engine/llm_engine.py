@@ -54,26 +54,63 @@ class LLMEngine:
         self.scheduler.add(seq)
         return seq
 
+    def schedule(self) -> tuple[list[Sequence], bool]:
+        """阶段 A（CPU）：一轮调度，返回 (本步序列, 是否含 prefill)。
+
+        只改调度器队列状态、纯 CPU、耗时微秒级。服务层（api_server）应在
+        持服务锁时调用，使入队/取消与调度互斥。
+        """
+        return self.scheduler.schedule()
+
+    def run_model(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        """阶段 B（GPU）：前向 + 采样，返回每条序列采样的 token（与 seqs 位置对应）。
+
+        不改任何调度器/序列状态，因此可以不在服务锁内执行——GPU 计算窗口里
+        请求入队与取消不会被阻塞。
+        """
+        return self.model_runner.call("run", seqs, is_prefill)
+
+    def finalize_step(self, seqs: list[Sequence], is_prefill: bool, token_ids: list[int]) -> list[tuple]:
+        """阶段 C（CPU）：更新序列/调度器状态、检查停止串，返回本步 outputs。
+
+        阶段 B 期间被取消的序列（status 已 FINISHED，如客户端断连 abort）跳过：
+        其状态已由取消流程定型，本步为它采样的 token 丢弃。
+        本步只是 prefill 一段（chunked prefill 未走完）的序列不产出 token，
+        不进入 outputs（其采样 token 只是 logit 副产物，从未并入序列）。
+        """
+        live = [(seq, tok) for seq, tok in zip(seqs, token_ids) if not seq.is_finished]
+        # 先按 scheduler.postprocess 的跳过口径算出"哪些序列本步会真正产出
+        # token"（num_cached 尚未回写、num_tokens 尚未追加，必须在此刻评估），
+        # 再回写状态
+        emitted = [not (is_prefill and seq.num_cached_tokens + seq.num_scheduled_tokens < seq.num_tokens)
+                   for seq, _ in live]
+        if live:
+            self.scheduler.postprocess([seq for seq, _ in live],
+                                       [tok for _, tok in live], is_prefill)
+            self._check_stop_strings([seq for seq, _ in live])
+        outputs = []
+        for (seq, tok), will_emit in zip(live, emitted):
+            if not will_emit:
+                continue    # 本步只是 prefill 的一段：未产出 token
+            reason = seq.finish_reason if seq.is_finished else None
+            outputs.append((seq.seq_id, [tok], seq.is_finished, reason))
+        return outputs
+
     def step(self):
-        """执行一步调度 + 推理。
+        """执行一步原子调度 + 推理（CLI 路径）：schedule → run_model → finalize_step。
 
         返回 (outputs, num_tokens)：
-        - outputs：本步批内每条被调度序列的 (seq_id, new_token_ids, finished, finish_reason)；
-          new_token_ids 为该序列本步新生成的 token（目前恒为 1 个），
-          finished 表示该序列本步结束后是否终止（eos / max_tokens），
-          finish_reason 为 OpenAI 语义的结束原因（"stop" / "length" / "abort"），未结束时为 None。
+        - outputs：本步批内每条实际产出 token 的序列的 (seq_id, new_token_ids,
+          finished, finish_reason)；new_token_ids 为该序列本步新生成的 token
+          （目前恒为 1 个），finished 表示该序列本步结束后是否终止
+          （eos / max_tokens / 停止串），finish_reason 为 OpenAI 语义的结束原因
+          （"stop" / "length" / "abort"），未结束时为 None。
         - num_tokens：本步处理的 token 数（prefill/混合步为正、纯 decode 步为负），用于吞吐展示。
         """
-        seqs, is_prefill = self.scheduler.schedule()
+        seqs, is_prefill = self.schedule()
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
-        self._check_stop_strings(seqs)
-        outputs = []
-        for seq, token_id in zip(seqs, token_ids):
-            reason = seq.finish_reason if seq.is_finished else None
-            outputs.append((seq.seq_id, [token_id], seq.is_finished, reason))
-        return outputs, num_tokens
+        token_ids = self.run_model(seqs, is_prefill)
+        return self.finalize_step(seqs, is_prefill, token_ids), num_tokens
 
     def _check_stop_strings(self, seqs):
         """OpenAI 停止串语义：生成文本以任一停止串结尾时立即终止（停止串本身保留在输出里）。
