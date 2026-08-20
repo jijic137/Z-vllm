@@ -14,7 +14,11 @@
 架构：单个全局引擎 + 后台 step-loop 线程。请求只负责入队序列、在自己的
 每序列 token 队列上等待；后台线程逐步推进引擎并把新生成 token 分发给所有
 在途请求，多个请求的 prefill/decode 因此能按调度器的混合批自然交错。
-stop / presence_penalty / frequency_penalty 等 OpenAI 字段被接受但忽略。
+stop 已支持（生成文本以任一停止串结尾即终止，finish_reason="stop"）；
+presence_penalty / frequency_penalty 仍被接受但忽略。
+流式请求被客户端放弃（断连）时自动取消对应序列并释放其 KV 块
+（finish_reason="abort"）；非流式请求的客户端断连暂不检测（请求会继续
+生成完）。
 """
 import argparse
 import json
@@ -80,6 +84,13 @@ class InferenceServer:
         with self.lock:
             self.queues.pop(seq_id, None)
 
+    def abort(self, seq_id: int) -> bool:
+        """取消在途请求（如流式客户端断连）：引擎释放其 KV 块，finish_reason="abort"。
+
+        与 step loop 共用 self.lock 串行化，保证引擎状态一致。"""
+        with self.lock:
+            return self.engine.abort_request(seq_id)
+
     def _next_event(self, seq_id: int):
         """阻塞取该序列的下一个事件（带看门狗）。
 
@@ -111,17 +122,25 @@ class InferenceServer:
         return token_ids, reason
 
     def iter_stream(self, seq_id: int):
-        """逐条 yield (new_token_ids, finished, finish_reason)；结束或放弃时注销队列。"""
+        """逐条 yield (new_token_ids, finished, finish_reason)；结束或放弃时注销队列。
+
+        客户端放弃流（断连）使生成器被 close 时，finally 中触发 abort，
+        释放该序列占用的 KV 块。"""
+        finished = False
         try:
             while True:
                 item = self._next_event(seq_id)
                 if item is None:
                     raise RuntimeError("推理引擎异常退出，请求中止")
                 yield item
+                finished = item[1]
                 if item[1]:
                     break
         finally:
             self._unregister(seq_id)
+            if not finished:
+                if self.abort(seq_id):
+                    print(f"[zvllm] aborted seq {seq_id}（客户端放弃流）")
 
     def shutdown(self):
         self._shutdown.set()
@@ -136,7 +155,7 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: int = Field(64, gt=0)
     seed: int | None = None
     stream: bool = False
-    # 以下字段为兼容 OpenAI 客户端而接受，当前未支持（忽略）：
+    # 以下字段为兼容 OpenAI 客户端而接受：stop 已支持；penalty 当前忽略
     stop: str | list[str] | None = None
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
@@ -154,6 +173,7 @@ class CompletionRequest(BaseModel):
     seed: int | None = None
     stream: bool = False
     echo: bool = False
+    stop: str | list[str] | None = None
 
 
 def _sse(obj: dict) -> str:
@@ -162,7 +182,7 @@ def _sse(obj: dict) -> str:
 
 def _sampling_params(req) -> SamplingParams:
     return SamplingParams(temperature=req.temperature, top_k=req.top_k, top_p=req.top_p,
-                          max_tokens=req.max_tokens, seed=req.seed)
+                          max_tokens=req.max_tokens, seed=req.seed, stop=req.stop)
 
 
 def create_app(server: InferenceServer) -> FastAPI:

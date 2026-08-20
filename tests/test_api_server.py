@@ -6,6 +6,7 @@
 /v1/completions（多 prompt 非流式、流式仅单 prompt）、非法参数 422/400。
 """
 import json
+import queue
 import sys
 import threading
 from types import SimpleNamespace
@@ -15,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from fastapi.testclient import TestClient
 
+from zvllm.sampling_params import SamplingParams
 from zvllm.entrypoints.openai.api_server import InferenceServer, create_app
 
 
@@ -52,6 +54,8 @@ class FakeEngine:
         self._lock = threading.Lock()
         self._next_seq_id = 1
         self._open: dict[int, dict] = {}
+        self.aborted: list[int] = []
+        self.last_sp = None
 
     @property
     def scheduler(self):
@@ -67,9 +71,18 @@ class FakeEngine:
             self._open[self._next_seq_id] = {
                 "pos": 0, "tokens": list(tokens), "reason": reason,
             }
+            self.last_sp = sampling_params
             seq = FakeSeq(self._next_seq_id)
             self._next_seq_id += 1
             return seq
+
+    def abort_request(self, request_id):
+        with self._lock:
+            if request_id in self._open:
+                del self._open[request_id]
+                self.aborted.append(request_id)
+                return True
+            return False
 
     def step(self):
         with self._lock:
@@ -192,6 +205,50 @@ def test_invalid_sampling_params_rejected():
     print("test_invalid_sampling_params_rejected OK")
 
 
+def test_stop_param_passthrough():
+    # stop 字段应透传进 SamplingParams（str 归一化为 list），chat/completions 两端点
+    engine = FakeEngine([("stop", [10]), ("stop", [20])])
+    server = InferenceServer(engine)
+    with TestClient(create_app(server)) as client:
+        r = client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1, "stop": "<10>",
+        })
+        assert r.status_code == 200, r.text
+        assert engine.last_sp.stop == ["<10>"]
+        r = client.post("/v1/completions", json={"prompt": "ab", "max_tokens": 1,
+                                                 "stop": ["x", "y"]})
+        assert r.status_code == 200, r.text
+        assert engine.last_sp.stop == ["x", "y"]
+    print("test_stop_param_passthrough OK")
+
+
+def test_iter_stream_aborts_on_abandon():
+    # 客户端放弃流（生成器被 close，如断连）时应触发 abort_request 并注销队列。
+    # 后台 step 线程会紧循环重入服务锁，可能把测试线程的锁等待饿死到序列跑完
+    #（非公平锁 + 忙循环，属测试环境假象；真实推理每步是 GPU 临界区，且断连
+    # 时序列尚有大量 token 在途），故这里先停掉 step 线程，再手动登记在途序列
+    # 并预置事件队列，使断言确定。step loop 与真实并发的交互由上方 HTTP 测试覆盖。
+    engine = FakeEngine([])
+    server = InferenceServer(engine)
+    server.shutdown()
+    server.step_thread.join(timeout=5)
+    assert not server.step_thread.is_alive(), "step 线程应已退出"
+    seq_id = 1
+    engine._open[seq_id] = {"pos": 0, "tokens": [10, 11, 12], "reason": "stop"}
+    q = queue.Queue()
+    server.queues[seq_id] = q
+    q.put(([10], False, None))   # 预置第一个 token 事件
+    gen = server.iter_stream(seq_id)
+    item = next(gen)
+    assert item == ([10], False, None)
+    gen.close()   # 模拟客户端断连
+    assert engine.aborted == [seq_id], "放弃流应触发 abort_request"
+    assert seq_id not in server.queues
+    assert seq_id not in engine._open, "被取消的序列应移出引擎"
+    print("test_iter_stream_aborts_on_abandon OK")
+
+
 if __name__ == "__main__":
     test_health_and_models()
     test_chat_completions_non_stream()
@@ -199,4 +256,6 @@ if __name__ == "__main__":
     test_completions_non_stream_multi_prompt()
     test_completions_stream_multi_prompt_rejected()
     test_invalid_sampling_params_rejected()
+    test_stop_param_passthrough()
+    test_iter_stream_aborts_on_abandon()
     print("ALL API SERVER TESTS PASSED")

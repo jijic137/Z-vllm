@@ -96,6 +96,25 @@ class Scheduler:
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
+    def finish(self, seq: Sequence):
+        """结束序列：释放其 KV 块并移出 running 队列（幂等）。
+
+        由 postprocess（eos / max_tokens 命中）与引擎（停止串命中）调用；
+        调用前须已设置 seq.finish_reason。"""
+        seq.status = SequenceStatus.FINISHED
+        self.block_manager.deallocate(seq)
+        if seq in self.running:
+            self.running.remove(seq)
+
+    def abort(self, seq: Sequence):
+        """取消请求：移出 waiting/running 队列并释放 KV 块，finish_reason 记 "abort"（幂等）。
+
+        chunked prefill 半途的序列同样适用：已分配的块一并释放。"""
+        seq.finish_reason = "abort"
+        if seq in self.waiting:
+            self.waiting.remove(seq)
+        self.finish(seq)
+
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
         for seq, token_id in zip(seqs, token_ids):
             self.block_manager.hash_blocks(seq)
@@ -104,7 +123,10 @@ class Scheduler:
             if is_prefill and seq.num_cached_tokens < seq.num_tokens:
                 continue
             seq.append_token(token_id)
-            if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
-                seq.status = SequenceStatus.FINISHED
-                self.block_manager.deallocate(seq)
-                self.running.remove(seq)
+            if seq.num_completion_tokens == seq.max_tokens:
+                seq.finish_reason = "length"
+            elif not seq.ignore_eos and token_id == self.eos:
+                seq.finish_reason = "stop"
+            else:
+                continue
+            self.finish(seq)

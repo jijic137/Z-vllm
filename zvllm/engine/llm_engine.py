@@ -6,7 +6,7 @@ from transformers import AutoTokenizer
 import torch.multiprocessing as mp
 
 from zvllm.config import Config
-from zvllm.sampling_params import SamplingParams
+from zvllm.sampling_params import SamplingParams, find_stop_match
 from zvllm.engine.sequence import Sequence
 from zvllm.engine.scheduler import Scheduler
 
@@ -61,21 +61,48 @@ class LLMEngine:
         - outputs：本步批内每条被调度序列的 (seq_id, new_token_ids, finished, finish_reason)；
           new_token_ids 为该序列本步新生成的 token（目前恒为 1 个），
           finished 表示该序列本步结束后是否终止（eos / max_tokens），
-          finish_reason 为 OpenAI 语义的结束原因（"stop" / "length"），未结束时为 None。
+          finish_reason 为 OpenAI 语义的结束原因（"stop" / "length" / "abort"），未结束时为 None。
         - num_tokens：本步处理的 token 数（prefill/混合步为正、纯 decode 步为负），用于吞吐展示。
         """
         seqs, is_prefill = self.scheduler.schedule()
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        self._check_stop_strings(seqs)
         outputs = []
         for seq, token_id in zip(seqs, token_ids):
-            if seq.is_finished:
-                reason = "length" if seq.num_completion_tokens >= seq.max_tokens else "stop"
-            else:
-                reason = None
+            reason = seq.finish_reason if seq.is_finished else None
             outputs.append((seq.seq_id, [token_id], seq.is_finished, reason))
         return outputs, num_tokens
+
+    def _check_stop_strings(self, seqs):
+        """OpenAI 停止串语义：生成文本以任一停止串结尾时立即终止（停止串本身保留在输出里）。
+
+        每步对设置了 stop 的序列解码其补全文本并做尾部匹配；本引擎规模下
+        逐步全量解码的开销可忽略（generate_stream 本就每步全量解码）。"""
+        for seq in seqs:
+            if seq.is_finished or not seq.stop:
+                continue
+            hit = find_stop_match(self.tokenizer.decode(seq.completion_token_ids), seq.stop)
+            if hit is not None:
+                seq.stop_reason = hit
+                seq.finish_reason = "stop"
+                self.scheduler.finish(seq)
+
+    def abort_request(self, request_id: int) -> bool:
+        """取消指定请求（request_id 为 add_request 返回的 Sequence.seq_id）。
+
+        仍在 waiting/running 中的请求立即移出队列并释放 KV 块，finish_reason 记为
+        "abort"；已结束或未知 id 返回 False（幂等）。
+
+        线程安全：引擎本身非线程安全，并发调用方（如 api_server 的 step 线程）
+        需自行用外部锁将本方法与 step() 串行化。
+        """
+        for seq in list(self.scheduler.waiting) + list(self.scheduler.running):
+            if seq.seq_id == request_id:
+                self.scheduler.abort(seq)
+                return True
+        return False
 
     def is_finished(self):
         return self.scheduler.is_finished()
@@ -96,7 +123,8 @@ class LLMEngine:
         """生成一批 prompt 的补全。
 
         stream=False（默认）：阻塞至全部请求完成，按输入顺序返回
-        list[{"text": 完整补全文本, "token_ids": 完整补全 token 列表}]；
+        list[{"text": 完整补全文本, "token_ids": 完整补全 token 列表,
+              "finish_reason": "stop" / "length" / "abort"}]；
         stream=True：返回生成器，逐请求逐 token 产出事件
         （{"index", "delta", "text", "token_ids", "finished"}），见 generate_stream。
         """
@@ -122,8 +150,10 @@ class LLMEngine:
                 if finished:
                     pbar.update(1)
         pbar.close()
-        return [{"text": self.tokenizer.decode(completion_ids[seq.seq_id]),
-                 "token_ids": completion_ids[seq.seq_id]} for seq in seqs]
+        # 被 abort_request 取消的请求可能一个 token 都未产出，用 .get 兜底
+        return [{"text": self.tokenizer.decode(completion_ids.get(seq.seq_id, [])),
+                 "token_ids": completion_ids.get(seq.seq_id, []),
+                 "finish_reason": seq.finish_reason} for seq in seqs]
 
     def generate_stream(
         self,
@@ -138,22 +168,39 @@ class LLMEngine:
         - text：到目前为止的完整补全文本
         - token_ids：到目前为止的完整补全 token 列表
         - finished：该请求是否结束（每个请求的最后一个事件为 True）
-        - finish_reason：OpenAI 语义的结束原因（"stop" / "length"），未结束时为 None
+        - finish_reason：OpenAI 语义的结束原因（"stop" / "length" / "abort"），未结束时为 None
 
-        注意：生成器未消费完就放弃（break / 异常）时，未完成请求仍驻留在引擎内，
-        该引擎不适合再混入其他请求（本版本不提供逐请求取消）。
+        逐请求取消：消费途中可随时调用 llm.abort_request(seq_id)；被取消的请求
+        会在下一轮循环立即收到 finished=True 的终止事件（finish_reason="abort"），
+        其 KV 块随即释放，引擎可继续处理其余请求。
         """
         seqs = self._add_requests(prompts, sampling_params)
         index_by_seq_id = {seq.seq_id: i for i, seq in enumerate(seqs)}
         completion_ids: dict[int, list[int]] = {}
-        pending = len(seqs)
+        pending = {seq.seq_id for seq in seqs}
         while pending:
+            # 被外部 abort_request 取消的序列不会再产出 token：先补发终止事件，
+            # 避免在已清空的引擎上多调一次 step()
+            for seq in seqs:
+                if seq.seq_id in pending and seq.is_finished:
+                    pending.discard(seq.seq_id)
+                    token_ids = completion_ids.get(seq.seq_id, [])
+                    yield {
+                        "index": index_by_seq_id[seq.seq_id],
+                        "delta": "",
+                        "text": self.tokenizer.decode(token_ids),
+                        "token_ids": token_ids,
+                        "finished": True,
+                        "finish_reason": seq.finish_reason,
+                    }
+            if not pending:
+                break
             outputs, _ = self.step()
             for seq_id, new_token_ids, finished, reason in outputs:
                 token_ids = completion_ids.get(seq_id, []) + new_token_ids
                 completion_ids[seq_id] = token_ids
                 if finished:
-                    pending -= 1
+                    pending.discard(seq_id)
                 yield {
                     "index": index_by_seq_id[seq_id],
                     "delta": self.tokenizer.decode(new_token_ids),

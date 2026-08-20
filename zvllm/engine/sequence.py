@@ -32,6 +32,9 @@ class Sequence:
         self.seed = sampling_params.seed
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        self.stop = list(sampling_params.stop) if sampling_params.stop else None
+        self.finish_reason: str | None = None    # 结束时写入："stop" / "length" / "abort"
+        self.stop_reason: str | None = None      # 命中的停止串（仅停止串终止时非 None）
 
     def __len__(self):
         return self.num_tokens

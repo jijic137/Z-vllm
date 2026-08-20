@@ -19,6 +19,9 @@ class FakeTokenizer:
 class FakeSeq:
     def __init__(self, seq_id):
         self.seq_id = seq_id
+        # generate_stream 的"外部取消"扫描会读取这两个属性（真实 Sequence 同构）
+        self.is_finished = False
+        self.finish_reason = None
 
 
 class FakeEngine:
@@ -30,15 +33,22 @@ class FakeEngine:
     def __init__(self, script):
         self.script = script
         self.step_count = 0
+        self._seqs: list[FakeSeq] = []
 
     def _add_requests(self, prompts, sampling_params):
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
-        return [FakeSeq(i) for i in range(len(prompts))]
+        self._seqs = [FakeSeq(i) for i in range(len(prompts))]
+        return self._seqs
 
     def step(self):
         outputs = self.script[self.step_count]
         self.step_count += 1
+        # 忠实模拟真实引擎：结束时在 Sequence 上落 finish_reason / is_finished
+        for seq_id, _new, finished, reason in outputs:
+            if finished:
+                self._seqs[seq_id].is_finished = True
+                self._seqs[seq_id].finish_reason = reason
         return outputs, 1
 
     def is_finished(self):
@@ -97,8 +107,8 @@ def test_generate_blocking_aggregation():
     ])
     results = LLMEngine.generate(engine, ["p0", "p1"], "sp", use_tqdm=False)
     assert results == [
-        {"text": "<10><11>", "token_ids": [10, 11]},
-        {"text": "<20><21>", "token_ids": [20, 21]},
+        {"text": "<10><11>", "token_ids": [10, 11], "finish_reason": "stop"},
+        {"text": "<20><21>", "token_ids": [20, 21], "finish_reason": "stop"},
     ]
     print("test_generate_blocking_aggregation OK")
 
