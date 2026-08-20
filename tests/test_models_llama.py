@@ -280,8 +280,8 @@ def test_attention_bias_inference(base):
     print("  ok")
 
 
-def test_forward(base, model_type, eps_field, eps, theta, seed):
-    print(f"test_forward_{model_type}")
+def check_forward(base, model_type, eps_field, eps, theta, seed):
+    print(f"check_forward_{model_type}")
     sd = make_hf_state_dict(seed)
     wdir = base / f"weights_{model_type}"
     wdir.mkdir(parents=True, exist_ok=True)
@@ -351,8 +351,8 @@ if __name__ == "__main__":
         test_config_unsupported(base)
         test_weight_loading(base)
         test_attention_bias_inference(base)
-        test_forward(base, "llama", "norm_eps", LLAMA_EPS, LLAMA_THETA, seed=1)
-        test_forward(base, "qwen2", "rms_norm_eps", QWEN2_EPS, QWEN2_THETA, seed=2)
+        check_forward(base, "llama", "norm_eps", LLAMA_EPS, LLAMA_THETA, seed=1)
+        check_forward(base, "qwen2", "rms_norm_eps", QWEN2_EPS, QWEN2_THETA, seed=2)
         test_tied_embeddings()
         test_build_model_dispatch(base)
     print("ALL PASSED")
