@@ -20,7 +20,7 @@
 * 🧮 **张量并行** — 支持 1–8 卡
 * 🧱 **专家并行（EP）** — MoE 专家切分到多卡，专家内 TP × EP 任意组合；decode 阶段 Triton grouped-GEMM 融合路径
 * ⚡ **CUDA graph + torch.compile** — 捕获 decode 图，降低 launch 开销
-* 🤖 **支持 Qwen3 稠密与 MoE 模型** — 如 Qwen3-0.6B、Qwen3-30B-A3B
+* 🤖 **支持 Qwen3 / LLaMA / Qwen2 模型家族（稠密 + MoE）** — 如 Qwen3-0.6B、Qwen3-30B-A3B、Llama-3.2-1B、Qwen2-0.5B
 * 🎲 **完整采样** — 贪心（temperature=0）、top-k、top-p、seed 可复现
 * 📡 **流式输出** — `generate(..., stream=True)` 逐 token 产出事件
 * 🔌 **OpenAI 兼容服务** — FastAPI + SSE，`/v1/chat/completions`、`/v1/completions` 直接对接 OpenAI SDK
@@ -54,8 +54,10 @@
     │   ├── sampler.py
     │   └── embed_head.py
     ├── models/
+    │   ├── __init__.py       # model_type 注册与分发（qwen3 / qwen3_moe / llama / qwen2）
     │   ├── qwen3.py          # Qwen3 稠密模型定义
-    │   └── qwen3_moe.py      # Qwen3 MoE（专家内 TP + 专家并行 EP）
+    │   ├── qwen3_moe.py      # Qwen3 MoE（专家内 TP + 专家并行 EP）
+    │   └── llama.py          # LLaMA / Qwen2 共用实现（同构家族，无 q/k norm）
     ├── entrypoints/
     │   └── openai/
     │       └── api_server.py # OpenAI 兼容 HTTP 服务（FastAPI + SSE）
@@ -136,7 +138,7 @@ huggingface-cli download --resume-download Qwen/Qwen3-0.6B \
 
 ## 快速开始
 
-完整示例见 `example.py`。API 风格对齐 vLLM：
+完整示例见 `example.py`（模型经 argv 传入：`python example.py [model]`，默认 `Qwen/Qwen3-0.6B`）。API 风格对齐 vLLM：
 
 ```python
 from zvllm import LLM, SamplingParams
@@ -248,6 +250,13 @@ print(resp.choices[0].message.content)
 * **AMD 单卡稠密吞吐**：Qwen3-0.6B，1× W7900D，SDPA 兜底 + eager，256 请求 / 133,966 输出 token，
   聚合吞吐 480.21 tok/s（278.97 s）；同一 256 请求集下上游 CUDA flash-attn + CUDA graph 配置为
   1434 tok/s（见 [Benchmark](#benchmark)），差距来自 attention 后端与图模式
+* **更多模型家族（Qwen2 / LLaMA）**：2026-08-20，1× W7900D，SDPA 兜底 + eager，单流生成
+  * Qwen2-0.5B（权重经魔搭，`tie_word_embeddings=true`，覆盖 tied lm_head 路径）：decode ≈35–36 tok/s，输出连贯
+  * Llama-3.2-1B-Instruct（魔搭镜像 `LLM-Research/Llama-3.2-1B-Instruct`）：decode ≈59–62 tok/s（prefill 41–82），
+    生成质量检查通过（自报身份正确、100 以内 25 个素数列表完整无误、正常 EOS 结束）
+  * Qwen3-0.6B 回归：≈67 tok/s（此前验证区间 35–69），模型分发 / RMSNorm 改动无回归
+  * CPU 单测：llama / qwen2 配置解析（eps / rope_theta 流通过）、权重加载布局、全 forward 对拍朴素参考
+    （max_diff 4.29e-6 / 6.56e-6）、tied embeddings、model_type 分发
 * **MoE 专家并行（EP）**：Qwen3-30B-A3B（128 专家 / 48 层全 MoE / bf16）
   * TP=2 / 4 / 8 均端到端跑通；纯 EP（`moe_ep_size=N`）与专家内 TP（`moe_ep_size=1`）均正确生成
   * CPU 单测：EP 路径 MoE 前向与逐 token 参照一致（bf16，max_diff 0.0）；
@@ -308,7 +317,7 @@ MoE 数字来自 `bench_moe_ep.py`，best of 2 runs）：
 
 ## Roadmap
 
-- [ ] 支持更多模型家族（LLaMA、Qwen2 等）
+- [x] 支持更多模型家族（LLaMA、Qwen2 等）（llama.py 同构共用实现 + model_type 注册分发，Qwen2-0.5B / Llama-3.2-1B 真机验证）
 - [ ] 权重量化支持（AWQ / GPTQ）
 - [ ] 逐请求取消与停止串（stop strings）
 - [x] MoE decode 性能优化（Triton grouped-GEMM 融合路径，EP=2 3.7 → 9.74 tok/s，约 2.6×）
