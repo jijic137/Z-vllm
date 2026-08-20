@@ -257,6 +257,11 @@ def test_astream_aborts_on_abandon():
         item = await gen.__anext__()
         assert item == ([10], False, None)
         await gen.aclose()   # 模拟客户端断连
+        # abort 现由独立 task 完成（规避 cancel scope 再次取消），等待其完成再断言
+        for _ in range(200):
+            if engine.aborted == [seq_id]:
+                break
+            await asyncio.sleep(0.01)
         assert engine.aborted == [seq_id], "放弃流应触发 abort_request"
         assert seq_id not in server.queues
         assert seq_id not in engine._open, "被取消的序列应移出引擎"

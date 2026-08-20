@@ -29,9 +29,13 @@
    （本文件另有独立 task 轮询 is_disconnected() 双保险）→ 流式生成器
    finally 触发 abort：取消对应序列（finish_reason="abort"）并释放其 KV
    块，避免"孤儿序列"继续空转到 max_tokens。非流式请求的客户端断连暂不
-   检测（请求会继续生成完）。注意：守护运行时 stdout 必须行缓冲（见
-   main）——重定向到文件时 stdout 默认块缓冲，abort 日志可能滞留缓冲区，
-   进程被 kill 时丢失，造成"断连未触发取消"的假象。
+   检测（请求会继续生成完）。两个真机实证的坑：a) abort 必须降级到
+   独立 task——响应任务是被 anyio cancel scope 取消的，scope 取消后
+   其内任何新的 await 都会被该 scope 再次取消，直接 await abort 会收
+   到第二次 CancelledError 而永不执行（见 _spawn_abort）；b) 守护运行
+   时 stdout 必须行缓冲（见 main）——重定向到文件时 stdout 默认块缓冲，
+   abort 日志可能滞留缓冲区，进程被 kill 时丢失，造成"断连未触发取消"
+   的假象。
 3. 看门狗：单步 GPU 阶段超过 STEP_TIMEOUT 未返回（如 GPU kernel 挂死）时，
    挂死 kernel 无法在进程内取消（torch 无进程内 reset），看门狗先通知全部
    在途请求快速失败，再退出进程，交由上层（systemd/手动）重启恢复，
@@ -70,6 +74,7 @@ class InferenceServer:
         self.model_name = os.path.basename(os.path.normpath(engine.config.model))
         self.lock = threading.Lock()
         self.queues: dict[int, asyncio.Queue] = {}
+        self._bg_tasks: set[asyncio.Task] = set()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._shutdown = threading.Event()
         self._hung = threading.Event()
@@ -170,6 +175,27 @@ class InferenceServer:
                 return self.engine.abort_request(seq_id)
         return await asyncio.to_thread(_abort)
 
+    def _spawn_abort(self, seq_id: int) -> None:
+        """把 abort 降级为独立 task 异步完成（fire-and-forget）。
+
+        调用点可能处于已取消的 anyio cancel scope 内：starlette 的
+        StreamingResponse 在断连时用 cancel scope 取消响应任务，而 scope
+        取消后，该 scope 内任何新的 await 都会被再次取消（真机实证：直接
+        await abort 会收到第二次 CancelledError，abort 永远不执行、KV 块
+        不释放）。独立 task 不受该 scope 影响；abort 本身是毫秒级的
+        引擎调用。"""
+        task = asyncio.get_running_loop().create_task(self._abort_bg(seq_id))
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
+    async def _abort_bg(self, seq_id: int) -> None:
+        try:
+            if await self.abort(seq_id):
+                print(f"[zvllm] aborted seq {seq_id}（客户端放弃流）", flush=True)
+        except Exception as e:
+            # 清理失败不掩盖原始异常，只留日志
+            print(f"[zvllm] abort failed seq {seq_id}: {e!r}", flush=True)
+
     async def _next_event(self, seq_id: int):
         """等待该序列的下一个事件（带看门狗）。
 
@@ -207,8 +233,9 @@ class InferenceServer:
     async def astream(self, seq_id: int):
         """逐条 yield (new_token_ids, finished, finish_reason)；结束或放弃时注销队列。
 
-        客户端放弃流（断连）时由外层 aclose() 本生成器，finally 触发 abort，
-        释放该序列占用的 KV 块。"""
+        客户端放弃流（断连）时由外层 aclose() 本生成器，finally 经 _spawn_abort
+        触发 abort（独立 task，规避 cancel scope 的再次取消），释放该序列
+        占用的 KV 块。"""
         finished = False
         try:
             while True:
@@ -222,8 +249,7 @@ class InferenceServer:
         finally:
             self.queues.pop(seq_id, None)
             if not finished:
-                if await self.abort(seq_id):
-                    print(f"[zvllm] aborted seq {seq_id}（客户端放弃流）")
+                self._spawn_abort(seq_id)
 
     def shutdown(self):
         self._shutdown.set()
