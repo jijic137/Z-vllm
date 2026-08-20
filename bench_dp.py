@@ -121,6 +121,8 @@ def main():
     ap.add_argument("--max-model-len", type=int, default=2048)
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     ap.add_argument("--enforce-eager", action="store_true")
+    ap.add_argument("--shm-name", default=None,
+                    help="多卡方法调用的共享内存名（默认 zvllm；机器上已有引擎占名时传不同值）")
     args = ap.parse_args()
 
     gpus = [int(x) for x in args.gpus.split(",") if x] or None
@@ -128,6 +130,8 @@ def main():
                          gpu_memory_utilization=args.gpu_memory_utilization,
                          moe_ep_size=args.ep,
                          enforce_eager=args.enforce_eager)
+    if args.shm_name:
+        engine_kwargs["shm_name"] = args.shm_name
 
     if args.dp > 1:
         assert gpus and len(gpus) == args.dp * args.tp, \
