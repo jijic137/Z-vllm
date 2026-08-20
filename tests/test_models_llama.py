@@ -244,6 +244,42 @@ def test_weight_loading(base):
     print("  ok")
 
 
+def test_attention_bias_inference(base):
+    """config 缺 attention_bias 字段（Qwen2-0.5B 发行版）：引擎 Config 从 checkpoint 推断，
+    有 bias 则建参数并精确加载，无 bias 则不建参数。"""
+    print("test_attention_bias_inference")
+    for has_bias in (True, False):
+        sd = make_hf_state_dict(3)
+        if has_bias:
+            for i in range(N_LAYERS):
+                sd[f"model.layers.{i}.self_attn.q_proj.bias"] = torch.randn(N_HEADS * HEAD_DIM, generator=torch.Generator().manual_seed(3 + i))
+                sd[f"model.layers.{i}.self_attn.k_proj.bias"] = torch.randn(N_KV_HEADS * HEAD_DIM, generator=torch.Generator().manual_seed(7 + i))
+                sd[f"model.layers.{i}.self_attn.v_proj.bias"] = torch.randn(N_KV_HEADS * HEAD_DIM, generator=torch.Generator().manual_seed(11 + i))
+        mdir = base / f"model_bias_{has_bias}"
+        write_cfg_json(mdir, "qwen2", "rms_norm_eps", QWEN2_EPS, QWEN2_THETA)
+        save_file(sd, str(mdir / "model.safetensors"))
+        # 模拟该发行版：config 对象上删掉 attention_bias 字段（部分 transformers 版本默认就有）
+        hf = AutoConfig.from_pretrained(str(mdir))
+        if hasattr(hf, "attention_bias"):
+            del hf.attention_bias
+        engine_cfg = Config(model=str(mdir))
+        assert engine_cfg.hf_config.attention_bias is has_bias, \
+            f"has_bias={has_bias} 时推断应为 {has_bias}，实际 {engine_cfg.hf_config.attention_bias}"
+        model = LlamaForCausalLM(engine_cfg.hf_config)
+        load_model(model, str(mdir))
+        qw, kw = N_HEADS * HEAD_DIM, N_KV_HEADS * HEAD_DIM
+        for i in range(N_LAYERS):
+            b = model.model.layers[i].self_attn.qkv_proj.bias
+            if not has_bias:
+                assert b is None, "无 bias checkpoint 不应创建 bias 参数"
+                continue
+            b = b.data
+            check_close(f"qkv.bias.q L{i}", b[0:qw], sd[f"model.layers.{i}.self_attn.q_proj.bias"], atol=0)
+            check_close(f"qkv.bias.k L{i}", b[qw:qw + kw], sd[f"model.layers.{i}.self_attn.k_proj.bias"], atol=0)
+            check_close(f"qkv.bias.v L{i}", b[qw + kw:qw + 2 * kw], sd[f"model.layers.{i}.self_attn.v_proj.bias"], atol=0)
+    print("  ok")
+
+
 def test_forward(base, model_type, eps_field, eps, theta, seed):
     print(f"test_forward_{model_type}")
     sd = make_hf_state_dict(seed)
@@ -314,6 +350,7 @@ if __name__ == "__main__":
         test_config_qwen2(base)
         test_config_unsupported(base)
         test_weight_loading(base)
+        test_attention_bias_inference(base)
         test_forward(base, "llama", "norm_eps", LLAMA_EPS, LLAMA_THETA, seed=1)
         test_forward(base, "qwen2", "rms_norm_eps", QWEN2_EPS, QWEN2_THETA, seed=2)
         test_tied_embeddings()
