@@ -17,6 +17,11 @@
 自然交错。全部请求处理在事件循环上进行（阻塞部分经 to_thread 跑在工作线程），
 长连接请求不占用工作线程。
 
+DP 模式（--dp-size >1）：后端换成 DPClient（进程级多副本：每副本一个独立
+引擎进程组，父进程路由 + 驱动）。此时不启动本类的 step/watchdog 线程，事件
+经每请求 on_event 回调跨线程投递到同一套每请求队列，副本级 step 挂死看门狗
+由 DPClient 负责（见 zvllm/engine/dp_engine.py）。
+
 健壮性设计（对应真机 e2e 暴露的两个问题：断连不触发取消、GPU step 卡死时
 服务整体 wedged）：
 1. 两阶段 step：step loop 只在阶段 A（调度）与阶段 C（状态回写）持服务锁，
@@ -67,19 +72,29 @@ STEP_TIMEOUT = 60.0
 
 
 class InferenceServer:
-    """引擎封装：后台 step-loop 线程 + 看门狗线程 + 每序列事件队列（asyncio）。"""
+    """引擎封装：后台 step-loop 线程 + 看门狗线程 + 每序列事件队列（asyncio）。
+
+    DP 模式（后端为 DPClient）：不启动 step/watchdog 线程——步进由客户端内部
+    driver 线程驱动，事件经每请求 on_event 回调跨线程投递，副本级挂死看门狗
+    归客户端所有（见 dp_engine）。"""
 
     def __init__(self, engine: LLM):
         self.engine = engine
-        self.model_name = os.path.basename(os.path.normpath(engine.config.model))
+        self.dp = getattr(engine, "dp_size", 1) > 1
+        model_path = engine.model if self.dp else engine.config.model
+        self.model_name = os.path.basename(os.path.normpath(model_path))
         self.lock = threading.Lock()
         self.queues: dict[int, asyncio.Queue] = {}
         self._bg_tasks: set[asyncio.Task] = set()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._shutdown = threading.Event()
         self._hung = threading.Event()
+        self._fatal = False
         self._in_gpu_phase = False
         self._gpu_since = 0.0
+        if self.dp:
+            engine.set_on_fatal(self._dp_on_fatal)
+            return
         self.step_thread = threading.Thread(target=self._step_loop, daemon=True)
         self.step_thread.start()
         self.watchdog_thread = threading.Thread(target=self._watchdog_loop, daemon=True)
@@ -102,6 +117,15 @@ class InferenceServer:
             return
         for q in list(self.queues.values()):
             self._loop.call_soon_threadsafe(q.put_nowait, None)
+
+    def _dp_on_fatal(self, msg: str):
+        """DPClient 致命回调（副本进程崩溃 / 副本 step 挂死）：全部在途请求快速失败。
+
+        副本致命后 DP 客户端会拒绝新请求；服务无法进程内恢复，需重启进程
+        （与单引擎 step 挂死同语义）。"""
+        print(f"[zvllm] FATAL: {msg}（全部在途请求已快速失败，请重启服务）", flush=True)
+        self._fatal = True
+        self._fail_all()
 
     def _step_loop(self):
         while not self._shutdown.is_set():
@@ -158,12 +182,37 @@ class InferenceServer:
         队列注册与序列入队必须在同一锁段内原子完成：否则 step loop 可能在
         队列注册前就产出第一个 token 而丢失。asyncio.Queue 的构造不依赖事件
         循环（3.10+ 惰性绑定），可在工作线程创建。"""
+        if self.dp:
+            return await asyncio.to_thread(self._add_dp, prompt_token_ids, sampling_params)
+
         def _add():
             with self.lock:
                 seq = self.engine.add_request(prompt_token_ids, sampling_params)
                 self.queues[seq.seq_id] = asyncio.Queue()
                 return seq.seq_id
         return await asyncio.to_thread(_add)
+
+    def _add_dp(self, prompt_token_ids: list[int], sampling_params: SamplingParams) -> int:
+        """DP 模式：入队 DP 客户端并注册事件队列。
+
+        on_event 回调从客户端 reader 线程调用，其时刻严格晚于本方法返回
+        （首个事件须经历副本 add/step 至少一次往返），故队列在 add 返回后
+        注册即可不丢首事件；回调内另有兜底等待防极小注册窗口。"""
+        holder = {}
+
+        def on_event(toks, finished, reason):
+            req_id = holder.get("id")
+            if req_id is None or req_id not in self.queues:
+                # 兜底：注册窗口未关闭则短暂等待再投递（事件按序到达）
+                deadline = time.monotonic() + 5.0
+                while (req_id is None or req_id not in self.queues) and time.monotonic() < deadline:
+                    time.sleep(0.001)
+            self._push(req_id, (toks, finished, reason))
+
+        req_id = self.engine.add_request(prompt_token_ids, sampling_params, on_event=on_event)
+        holder["id"] = req_id
+        self.queues[req_id] = asyncio.Queue()
+        return req_id
 
     async def abort(self, seq_id: int) -> bool:
         """取消在途请求（如客户端断连）：引擎释放其 KV 块，finish_reason="abort"。
@@ -207,6 +256,11 @@ class InferenceServer:
             try:
                 return await asyncio.wait_for(q.get(), timeout=1.0)
             except asyncio.TimeoutError:
+                if self.dp:
+                    # fatal 时 _fail_all 已推哨兵；哨兵未达则继续等
+                    if self._fatal:
+                        raise RuntimeError("推理引擎异常退出，请求中止")
+                    continue
                 if not self.step_thread.is_alive():
                     raise RuntimeError("推理引擎 step 线程已退出，请求中止")
                 if self._hung.is_set():
@@ -253,6 +307,8 @@ class InferenceServer:
 
     def shutdown(self):
         self._shutdown.set()
+        if self.dp:
+            self.engine.close()
 
 
 class ChatCompletionRequest(BaseModel):
@@ -455,6 +511,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--moe-tp-size", type=int, default=None,
                    help="专家内 TP；MoE 模型需满足 moe_tp_size * moe_ep_size == tensor_parallel_size")
     p.add_argument("--moe-ep-size", type=int, default=1, help="专家并行 EP")
+    p.add_argument("--dp-size", type=int, default=1,
+                   help="进程级 DP 副本数（每副本独立引擎；dp×tp 需等于 --dp-gpus 数量）")
+    p.add_argument("--dp-gpus", default="",
+                   help="DP 使用的全局 GPU 号列表，如 0,1,2,3（--dp-size>1 时必填）")
     p.add_argument("--max-model-len", type=int, default=4096)
     p.add_argument("--max-num-seqs", type=int, default=512)
     p.add_argument("--max-num-batched-tokens", type=int, default=16384)
@@ -494,7 +554,21 @@ def main():
     )
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
     print(f"Loading model {args.model} ...")
-    engine = LLM(args.model, **kwargs)
+    if args.dp_size > 1:
+        from zvllm.engine.dp_engine import DPClient
+        gpus = [int(x) for x in args.dp_gpus.split(",") if x.strip()]
+        assert len(gpus) == args.dp_size * args.tensor_parallel_size, \
+            f"--dp-gpus 数量（{len(gpus)}）需等于 dp×tp（{args.dp_size * args.tensor_parallel_size}）"
+        dp_kwargs = {k: v for k, v in kwargs.items()
+                     if k not in ("tensor_parallel_size", "master_port")}
+        engine = DPClient(args.model, dp_size=args.dp_size,
+                          tensor_parallel_size=args.tensor_parallel_size,
+                          gpus=gpus, master_port=args.master_port,
+                          step_timeout=STEP_TIMEOUT, **dp_kwargs)
+        print(f"DP 副本就绪: dp={args.dp_size} tp={args.tensor_parallel_size} "
+              f"max_model_len={engine.max_model_len} kv_blocks={engine.kv_blocks}", flush=True)
+    else:
+        engine = LLM(args.model, **kwargs)
     server = InferenceServer(engine)
     app = create_app(server)
     print(f"Z-vllm serving {server.model_name} on http://{args.host}:{args.port} (OpenAI 兼容)")
