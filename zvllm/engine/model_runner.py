@@ -9,6 +9,7 @@ from zvllm.layers.attention import HAS_FLASH_ATTN
 from zvllm.engine.sequence import Sequence
 from zvllm.models import build_model
 from zvllm.layers.sampler import Sampler
+from zvllm.layers.spec_decode import accept_drafts
 from zvllm.utils.context import set_context, get_context, reset_context
 from zvllm.utils.loader import load_model
 
@@ -162,12 +163,20 @@ class ModelRunner:
         slot_mapping = []
         block_tables = None
         for seq in seqs:
-            start = seq.num_cached_tokens
-            seqlen_q = seq.num_scheduled_tokens
+            if seq.draft_tokens:    # 投机验证步：回喂 [last_token, 草稿...]，槽位 [L-1, L+γ)
+                start = len(seq) - 1
+                seqlen_q = 1 + len(seq.draft_tokens)
+            else:
+                start = seq.num_cached_tokens
+                seqlen_q = seq.num_scheduled_tokens
             end = start + seqlen_q
             seqlen_k = end
             if seq.is_prefill:
                 input_ids.extend(seq[start:end])
+            elif seq.draft_tokens:
+                # 与 decode 快路径同理：last_token 由 pickle 携带，草稿一并回喂
+                input_ids.append(seq.last_token)
+                input_ids.extend(seq.draft_tokens)
             else:    # 混合步中的 decode 序列：TP worker 反序列化后只剩 last_token
                 assert seqlen_q == 1
                 input_ids.append(seq.last_token)
@@ -244,13 +253,45 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        sample_args = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, *sample_args).tolist() if self.rank == 0 else None
+    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[list[int]] | None:
+        # 批内任何序列带草稿即走 varlen 路径（验证步 = 短 prefill 段 + 已缓存前缀）
+        use_varlen = is_prefill or any(seq.draft_tokens for seq in seqs)
+        input_ids, positions = self.prepare_prefill(seqs) if use_varlen else self.prepare_decode(seqs)
+        logits = self.run_model(input_ids, positions, use_varlen)
+        token_lists = self._sample_all(seqs, logits) if self.rank == 0 else None
         reset_context()
-        return token_ids
+        return token_lists
+
+    def _sample_all(self, seqs: list[Sequence], logits: torch.Tensor) -> list[list[int]]:
+        """每条序列产出一个 token 列表（非投机恒为单元素）。
+
+        行布局：批内各序列按序占 seqlen_q 行 logit。非投机序列从本段末行
+        （emission 行）批量采样；投机序列对 γ+1 行做接受-拒绝（_accept_one）。"""
+        token_lists: list[list[int]] = [[] for _ in seqs]
+        emit_idx: list[tuple[int, int]] = []
+        spec_items: list[tuple[int, Sequence, int]] = []
+        row = 0
+        for i, seq in enumerate(seqs):
+            if seq.draft_tokens:
+                spec_items.append((i, seq, row))
+                row += len(seq.draft_tokens) + 1
+            else:
+                emit_idx.append((i, row + seq.num_scheduled_tokens - 1))
+                row += seq.num_scheduled_tokens
+        if emit_idx:
+            emit_seqs = [seqs[i] for i, _ in emit_idx]
+            emit_logits = logits[torch.tensor([r for _, r in emit_idx], device=logits.device)]
+            tokens = self.sampler(emit_logits, *self.prepare_sample(emit_seqs))
+            for (i, _), tok in zip(emit_idx, tokens):
+                token_lists[i] = [int(tok)]
+        for i, seq, row0 in spec_items:
+            g = len(seq.draft_tokens)
+            token_lists[i] = self._accept_one(seq, logits[row0:row0 + g + 1])
+        return token_lists
+
+    def _accept_one(self, seq: Sequence, rows: torch.Tensor) -> list[int]:
+        """单序列投机验证的接受-拒绝（实现见 zvllm.layers.spec_decode.accept_drafts）。"""
+        return accept_drafts(self.sampler, seq, rows)
 
     @torch.inference_mode()
     def capture_cudagraph(self):

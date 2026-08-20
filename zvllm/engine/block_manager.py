@@ -99,27 +99,45 @@ class BlockManager:
                 self._deallocate_block(block_id)
         seq.num_cached_tokens = 0
         seq.block_table.clear()
+        seq.num_hashed_tokens = 0
+
+    def _blocks_needed(self, seq: Sequence, n: int) -> int:
+        """为追加 n 个新 token（位置 len..len+n-1）所需的未分配块数。
+
+        最后一个已写 token 位置 len-1 所在块视为已分配（decode/verify 回喂时
+        只是重写该槽）；n=0 即普通 decode 的"最后一个 token 所在块"口径。"""
+        target = (len(seq) + n - 1) // self.block_size
+        return max(0, target + 1 - len(seq.block_table))
 
     def can_append(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= self._block_needed(seq)
+        return len(self.free_block_ids) >= self._blocks_needed(seq, 0)
+
+    def can_append_n(self, seq: Sequence, n: int) -> bool:
+        return len(self.free_block_ids) >= self._blocks_needed(seq, n)
 
     def may_append(self, seq: Sequence):
-        if self._block_needed(seq):
+        self.may_append_n(seq, 0)
+
+    def may_append_n(self, seq: Sequence, n: int):
+        """预留覆盖位置 len-1..len+n-1 的块（投机验证步为草稿 token 预留 KV 槽）。"""
+        target = (len(seq) + n - 1) // self.block_size
+        while len(seq.block_table) <= target:
             seq.block_table.append(self._allocate_block())
 
-    def _block_needed(self, seq: Sequence) -> int:
-        """当前最后一个 token（位置 len-1）所在块尚未分配，需要扩容。
+    def hash_blocks_upto(self, seq: Sequence, safe_len: int):
+        """把 KV 可信长度 safe_len 内新填满的块写入 prefix cache 哈希表（增量、游标单调）。
 
-        旧条件 len(seq) % block_size == 1 对 prompt 长度 % block_size == 1 的序列
-        会多分配一块（prefill 时该块已分配），使 decode 槽位公式 table[-1] 指向错误块。
-        上游 nano-vllm issue #240 / #66。
-        """
-        return 1 if (len(seq) - 1) // self.block_size >= len(seq.block_table) else 0
-
-    def hash_blocks(self, seq: Sequence):
-        start = seq.num_cached_tokens // self.block_size
-        end = (seq.num_cached_tokens + seq.num_scheduled_tokens) // self.block_size
-        if start == end: return
+        safe_len 语义：位置 < safe_len 的 KV 均已写入且与官方 token 一致。各步的
+        safe_len：prefill 段 = 段末（段内槽位本步全部写入）；decode = 旧长度
+        （本步只重写位置 len-1，新 token 的 KV 延迟到下一步）；投机验证 = 新长度-1
+        （bonus token 的 KV 延迟到下一步回喂时重写）。旧实现对 decode 用"新长度"
+        作边界，恰在总长度凑满整块时会把最后一个未写入 KV 的块提前入哈希表，
+        复用方读到垃圾 KV；这里按真实可信长度修正。"""
+        start = seq.num_hashed_tokens // self.block_size
+        end = safe_len // self.block_size
+        if start >= end:
+            seq.num_hashed_tokens = safe_len
+            return
         h = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1
         for i in range(start, end):
             block = self.blocks[seq.block_table[i]]
@@ -127,3 +145,4 @@ class BlockManager:
             h = self.compute_hash(token_ids, h)
             block.update(h, token_ids)
             self.hash_to_block_id[h] = block.block_id
+        seq.num_hashed_tokens = safe_len

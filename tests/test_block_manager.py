@@ -54,7 +54,7 @@ def run_decode_case(n0, steps, num_blocks=64):
 def test_decode_growth():
     for n0 in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 17):
         run_decode_case(n0, 12)
-    # 补上"下一次调度才分配"的边界：表长不足时 _block_needed 恰好为 1
+    # 补上"下一次调度才分配"的边界：表长不足时 _blocks_needed(seq, 0) 恰好为 1
     seq = Sequence(list(range(5)))
     bm = BlockManager(64, BS)
     bm.allocate(seq, bm.can_allocate(seq))
@@ -62,7 +62,7 @@ def test_decode_growth():
         assert bm.can_append(seq)
         bm.may_append(seq)
         seq.append_token(99)
-    assert len(seq.block_table) == 4 and bm._block_needed(seq) == 1
+    assert len(seq.block_table) == 4 and bm._blocks_needed(seq, 0) == 1
     bm.may_append(seq)
     assert len(seq.block_table) == seq.num_blocks == 5
     assert 64 - len(bm.free_block_ids) == seq.num_blocks
@@ -75,11 +75,9 @@ def test_prefix_cache():
     s1 = Sequence(common + [100, 101])
     s2 = Sequence(common + [200, 201, 202])
     bm.allocate(s1, bm.can_allocate(s1))
-    # 模拟 prefill 完成后的登记（与 postprocess 相同顺序：先 hash 再更新 num_cached）
-    s1.num_scheduled_tokens = 34
-    bm.hash_blocks(s1)
+    # 模拟 prefill 完成后的登记：可信长度 34 -> 只登记前 8 个满块
+    bm.hash_blocks_upto(s1, 34)
     s1.num_cached_tokens = 34
-    s1.num_scheduled_tokens = 0
     # s2 应命中 8 个缓存块，只需新分配 1 块
     cached = bm.can_allocate(s2)
     assert cached == 8, cached
@@ -105,10 +103,8 @@ def test_allocate_reuse_cleared_hash():
     bm = BlockManager(8, BS)
     s1 = Sequence(list(range(8)))
     bm.allocate(s1, bm.can_allocate(s1))
-    s1.num_scheduled_tokens = 8
-    bm.hash_blocks(s1)
+    bm.hash_blocks_upto(s1, 8)
     s1.num_cached_tokens = 8
-    s1.num_scheduled_tokens = 0
     victim = s1.block_table[0]
     old_hash = bm.blocks[victim].hash
     bm.deallocate(s1)

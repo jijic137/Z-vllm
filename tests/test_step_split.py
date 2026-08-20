@@ -38,7 +38,8 @@ class FakeTokenizer:
 
 
 class FakeModelRunner:
-    """假 model_runner：call("run", seqs, is_prefill) 为每条序列返回固定 token。"""
+    """假 model_runner：call("run", seqs, is_prefill) 为每条序列返回固定 token 列表
+    （与真实引擎契约一致：list[list[int]]，非投机步每条 1 个）。"""
 
     def __init__(self, token=7):
         self.token = token
@@ -46,7 +47,7 @@ class FakeModelRunner:
     def call(self, method, *args):
         assert method == "run", method
         seqs, is_prefill = args
-        return [self.token] * len(seqs)
+        return [[self.token] for _ in seqs]
 
 
 def make_engine(**kwargs):

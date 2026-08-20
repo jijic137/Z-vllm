@@ -41,11 +41,19 @@ class Config:
     shm_size: int = 2**20                # 共享内存大小（字节）
     max_graph_bs: int = 512              # CUDA Graph 捕获的最大 batch size
     weight_bits: int = 16                # 16=bf16（默认）；8=int8 加载时量化（per-group 128 对称，不支持 int4）
+    spec_decode: str = "off"             # 投机解码：off / ngram（序列自身历史的 n-gram 草稿，零训练）
+    spec_gamma: int = 4                  # 每步最多草稿 token 数（验证步实际处理 1+gamma 个 token）
+    spec_ngram: int = 4                  # n-gram 匹配长度：尾部 n 个 token 在自身历史中复现时取后续 token 作草稿
 
     def __post_init__(self):
         assert self.weight_bits in (8, 16), \
             (f"weight_bits 只支持 8（int8 加载时量化）或 16（bf16），"
              f"int4 当前版本不支持（当前 {self.weight_bits}）")
+        assert self.spec_decode in ("off", "ngram"), \
+            f"spec_decode 必须是 off / ngram（当前 {self.spec_decode!r}）"
+        if self.spec_decode == "ngram":
+            assert 1 <= self.spec_gamma <= 8, f"spec_gamma 需在 1..8（当前 {self.spec_gamma}）"
+            assert 2 <= self.spec_ngram <= 8, f"spec_ngram 需在 2..8（当前 {self.spec_ngram}）"
         from transformers import AutoConfig
         from zvllm.utils.model_download import resolve_model_path
 

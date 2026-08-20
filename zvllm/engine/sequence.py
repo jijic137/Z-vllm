@@ -26,6 +26,9 @@ class Sequence:
         self.num_scheduled_tokens = 0
         self.is_prefill = True
         self.block_table = []
+        self.draft_tokens = []              # 本步投机草稿（调度时写入，验证步回喂；worker 侧经 pickle 获得）
+        self.num_hashed_tokens = 0          # prefix cache 哈希游标：KV 可信长度内已哈希到该 token 数
+        self.ngram_positions = None         # n-gram 草稿索引（仅 rank0 构建使用，不参与 pickle）
         self.temperature = sampling_params.temperature
         self.top_k = sampling_params.top_k
         self.top_p = sampling_params.top_p
@@ -78,14 +81,17 @@ class Sequence:
     def __getstate__(self):
         last_state = self.last_token if not self.is_prefill else self.token_ids
         return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens,
-                self.num_scheduled_tokens, self.block_table, last_state, self.is_prefill)
+                self.num_scheduled_tokens, self.block_table, last_state, self.is_prefill,
+                self.draft_tokens, self.num_hashed_tokens)
 
     def __setstate__(self, state):
         self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, \
-            self.num_scheduled_tokens, self.block_table, last_state, self.is_prefill = state
+            self.num_scheduled_tokens, self.block_table, last_state, self.is_prefill, \
+            self.draft_tokens, self.num_hashed_tokens = state
         if isinstance(last_state, list):
             self.token_ids = last_state
             self.last_token = self.token_ids[-1]
         else:
             self.token_ids = []
             self.last_token = last_state
+        self.ngram_positions = None

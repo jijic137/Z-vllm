@@ -62,15 +62,21 @@ class LLMEngine:
         """
         return self.scheduler.schedule()
 
-    def run_model(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        """阶段 B（GPU）：前向 + 采样，返回每条序列采样的 token（与 seqs 位置对应）。
+    def run_model(self, seqs: list[Sequence], is_prefill: bool) -> list[list[int]]:
+        """阶段 B（GPU）：前向 + 采样，返回每条序列的产出 token 列表（与 seqs 位置对应）。
 
+        非投机步每条恒为 1 个 token；投机验证步为 1..1+γ 个（接受的草稿前缀 + bonus）。
         不改任何调度器/序列状态，因此可以不在服务锁内执行——GPU 计算窗口里
         请求入队与取消不会被阻塞。
         """
         return self.model_runner.call("run", seqs, is_prefill)
 
-    def finalize_step(self, seqs: list[Sequence], is_prefill: bool, token_ids: list[int]) -> list[tuple]:
+    @property
+    def spec_stats(self) -> dict:
+        """投机解码统计：{proposed_tokens, accepted_tokens, steps}，接受率 = accepted/proposed。"""
+        return self.scheduler.spec_stats
+
+    def finalize_step(self, seqs: list[Sequence], is_prefill: bool, token_lists: list[list[int]]) -> list[tuple]:
         """阶段 C（CPU）：更新序列/调度器状态、检查停止串，返回本步 outputs。
 
         阶段 B 期间被取消的序列（status 已 FINISHED，如客户端断连 abort）跳过：
@@ -78,22 +84,20 @@ class LLMEngine:
         本步只是 prefill 一段（chunked prefill 未走完）的序列不产出 token，
         不进入 outputs（其采样 token 只是 logit 副产物，从未并入序列）。
         """
-        live = [(seq, tok) for seq, tok in zip(seqs, token_ids) if not seq.is_finished]
-        # 先按 scheduler.postprocess 的跳过口径算出"哪些序列本步会真正产出
-        # token"（num_cached 尚未回写、num_tokens 尚未追加，必须在此刻评估），
-        # 再回写状态
-        emitted = [not (is_prefill and seq.num_cached_tokens + seq.num_scheduled_tokens < seq.num_tokens)
-                   for seq, _ in live]
+        live = [(seq, toks) for seq, toks in zip(seqs, token_lists) if not seq.is_finished]
+        # 产出判定与状态回写都在 postprocess_multi 内完成（其判定使用回写前的
+        # num_cached/num_scheduled 口径，与旧实现一致）
+        emitted = (self.scheduler.postprocess_multi([seq for seq, _ in live],
+                                                    [toks for _, toks in live], is_prefill)
+                   if live else [])
         if live:
-            self.scheduler.postprocess([seq for seq, _ in live],
-                                       [tok for _, tok in live], is_prefill)
             self._check_stop_strings([seq for seq, _ in live])
         outputs = []
-        for (seq, tok), will_emit in zip(live, emitted):
-            if not will_emit:
+        for (seq, _), em in zip(live, emitted):
+            if not em:
                 continue    # 本步只是 prefill 的一段：未产出 token
             reason = seq.finish_reason if seq.is_finished else None
-            outputs.append((seq.seq_id, [tok], seq.is_finished, reason))
+            outputs.append((seq.seq_id, em, seq.is_finished, reason))
         return outputs
 
     def step(self):
@@ -102,7 +106,7 @@ class LLMEngine:
         返回 (outputs, num_tokens)：
         - outputs：本步批内每条实际产出 token 的序列的 (seq_id, new_token_ids,
           finished, finish_reason)；new_token_ids 为该序列本步新生成的 token
-          （目前恒为 1 个），finished 表示该序列本步结束后是否终止
+          （投机步可多个），finished 表示该序列本步结束后是否终止
           （eos / max_tokens / 停止串），finish_reason 为 OpenAI 语义的结束原因
           （"stop" / "length" / "abort"），未结束时为 None。
         - num_tokens：本步处理的 token 数（prefill/混合步为正、纯 decode 步为负），用于吞吐展示。
