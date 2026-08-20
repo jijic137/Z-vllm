@@ -465,6 +465,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--shm-name", default="zvllm", help="多卡方法调用的共享内存名")
     p.add_argument("--shm-size", type=int, default=2 ** 20, help="共享内存大小（字节）")
     p.add_argument("--enforce-eager", action="store_true", help="禁用 CUDA Graph（MoE 会自动强制）")
+    p.add_argument("--weight-bits", type=int, default=16,
+                   help="权重点数：16=bf16（默认）；8=int8 加载时量化（per-group 128 对称，不支持 int4）")
     return p.parse_args()
 
 
@@ -488,6 +490,7 @@ def main():
         shm_name=args.shm_name,
         shm_size=args.shm_size,
         enforce_eager=args.enforce_eager,
+        weight_bits=args.weight_bits,
     )
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
     print(f"Loading model {args.model} ...")

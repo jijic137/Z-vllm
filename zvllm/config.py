@@ -40,8 +40,12 @@ class Config:
     shm_name: str = "zvllm"              # 多卡方法调用的共享内存名
     shm_size: int = 2**20                # 共享内存大小（字节）
     max_graph_bs: int = 512              # CUDA Graph 捕获的最大 batch size
+    weight_bits: int = 16                # 16=bf16（默认）；8=int8 加载时量化（per-group 128 对称，不支持 int4）
 
     def __post_init__(self):
+        assert self.weight_bits in (8, 16), \
+            (f"weight_bits 只支持 8（int8 加载时量化）或 16（bf16），"
+             f"int4 当前版本不支持（当前 {self.weight_bits}）")
         from transformers import AutoConfig
         from zvllm.utils.model_download import resolve_model_path
 

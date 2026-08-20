@@ -10,13 +10,16 @@ SUPPORTED_MODEL_TYPES = ("qwen3", "qwen3_moe", "llama", "qwen2")
 
 
 def build_model(hf_config, engine_config, moe_tp_group=None):
+    # engine_config 允许为 None（单测只验证 model_type 分发）
+    quantized = engine_config is not None and engine_config.weight_bits == 8
     model_type = getattr(hf_config, "model_type", "")
     if model_type == "qwen3_moe":
-        return Qwen3MoeForCausalLM(hf_config, engine_config.moe_tp_size, engine_config.moe_ep_size, moe_tp_group)
+        return Qwen3MoeForCausalLM(hf_config, engine_config.moe_tp_size, engine_config.moe_ep_size,
+                                   moe_tp_group, quantized=quantized)
     if model_type == "qwen3":
-        return Qwen3ForCausalLM(hf_config)
+        return Qwen3ForCausalLM(hf_config, quantized=quantized)
     if model_type in ("llama", "qwen2"):
         # 两家族架构同构（无 q/k norm 的 LLaMA 家族），共用 LlamaForCausalLM
-        return LlamaForCausalLM(hf_config)
+        return LlamaForCausalLM(hf_config, quantized=quantized)
     raise ValueError(
         f"不支持的 model_type: {model_type!r}（当前支持 {', '.join(SUPPORTED_MODEL_TYPES)}）")

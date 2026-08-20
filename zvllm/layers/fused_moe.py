@@ -18,16 +18,20 @@ decode 阶段每层 64 个本地专家 × 48 层 ≈ 3000 次同步 + 上万次 
   padding 到 R=T*K 行，两次 bmm；padding 行输入为 0，GEMM 输出严格为 0，不贡献。
 
 两者都不改变数学定义：out[t] = Σ_{(t,s) 路由到本地专家} w_{t,s} · expert_{e(t,s)}(x[t])。
+
+两个后端都支持 W8 量化权重（int8 + per-group 128 scale）：Triton 路径在
+kernel K 循环内反量化（不物化），bmm 路径先物化反量化（仅 CPU 单测 /
+调试用；GPU 上量化配置由 MoE 块启动断言强制走 Triton）。
 """
 import torch
 import torch.nn.functional as F
 
-try:
+from zvllm.layers.triton_utils import HAS_TRITON, triton_available  # noqa: F401（模型层经本模块引用）
+from zvllm.quantization import WEIGHT_GROUP, dequantize_weight
+
+if HAS_TRITON:
     import triton
     import triton.language as tl
-    HAS_TRITON = True
-except ImportError:
-    HAS_TRITON = False
 
 # 融合路径 token 阈值：T 更大批次（prefill）保留原遍历实现，避免 [E, R=T*K, H] 缓冲膨胀
 FUSED_MAX_TOKENS = 256
@@ -35,29 +39,6 @@ BMM_MAX_TOKENS = 32
 
 # Triton 块尺寸（decode 导向：M 行很少，BN/BK 取大让单 program 干满权重流式读取）
 _BM, _BN, _BK = 16, 64, 64
-
-_triton_ok: bool | None = None
-
-
-def triton_available() -> bool:
-    """triton 可导入 + 在当前设备能跑通（惰性探测一次；gfx 等非主流架构可能编译失败）。"""
-    global _triton_ok
-    if not HAS_TRITON:
-        return False
-    if _triton_ok is None:
-        try:
-
-            @triton.jit
-            def _probe(x_ptr, BLOCK: tl.constexpr):
-                offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-                tl.store(x_ptr + offs, tl.load(x_ptr + offs) + 1.0)
-
-            x = torch.zeros(256, device="cuda", dtype=torch.float32)
-            _probe[(1,)](x, BLOCK=256)
-            _triton_ok = bool((x == 1.0).all().item())
-        except Exception:
-            _triton_ok = False
-    return _triton_ok
 
 
 def _align_pairs(e_ids: torch.Tensor, num_experts: int, block_m: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -97,8 +78,9 @@ if HAS_TRITON:
     @triton.jit
     def _moe_grouped_gemm(
         a_ptr,      # bf16：A_BY_TOKEN 时 [T, K_IN]（x，按 token 取行）；否则 [M_max, K_IN]（h，按排序行取行）
-        w_ptr,      # [E, N_OUT, K_IN] bf16（stacked 专家权重）
+        w_ptr,      # [E, N_OUT, K_IN] bf16 或 int8（stacked 专家权重，QUANT_W 时 int8）
         c_ptr,      # [M_max, N_OUT] bf16
+        w_s_ptr,    # [E, N_OUT, K_IN // GROUP] bf16 per-group scale（QUANT_W=False 时不读，传任意指针）
         sorted_ids,  # [M_max] int32 pair id（哨兵 = N_PAIRS）
         expert_ids,  # [M_max // BM] int32（-1 = 跳过）
         N_PAIRS,     # T * K_TOPK
@@ -109,6 +91,8 @@ if HAS_TRITON:
         BN: tl.constexpr,
         BK: tl.constexpr,
         A_BY_TOKEN: tl.constexpr,
+        QUANT_W: tl.constexpr,
+        GROUP: tl.constexpr,
     ):
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
@@ -126,10 +110,19 @@ if HAS_TRITON:
         b_ptrs = w_ptr + e.to(tl.int64) * (N_OUT * K_IN) \
             + (pid_n * BN + tl.arange(0, BN))[:, None].to(tl.int64) * K_IN \
             + tl.arange(0, BK)[None, :]
+        if QUANT_W:
+            b_s_base = w_s_ptr + e.to(tl.int64) * (N_OUT * (K_IN // GROUP)) \
+                + (pid_n * BN + tl.arange(0, BN))[:, None].to(tl.int64) * (K_IN // GROUP)
         acc = tl.zeros((BM, BN), dtype=tl.float32)
-        for _ in range(0, K_IN, BK):
+        for k in range(0, K_IN, BK):
             a = tl.load(a_ptrs, mask=valid[:, None], other=0.0)
-            b = tl.load(b_ptrs)
+            if QUANT_W:
+                # kernel 内反量化：int8 读 × 每行 group scale → bf16（K tile 恒在单个 group 内）
+                w_q = tl.load(b_ptrs)
+                s = tl.load(b_s_base + (k // GROUP))
+                b = (w_q.to(tl.float32) * s.to(tl.float32)[:, None]).to(tl.bfloat16)
+            else:
+                b = tl.load(b_ptrs)
             acc = tl.dot(a, tl.trans(b), acc)
             a_ptrs += BK
             b_ptrs += BK
@@ -152,13 +145,19 @@ def fused_moe_triton(
     local_start: int,
     w13: torch.Tensor,
     w2: torch.Tensor,
+    w13_scale: torch.Tensor | None = None,
+    w2_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Triton grouped GEMM 融合路径。
 
     x: [T, H] bf16；topk_weights: [T, K]（已归一化）；topk_ids: [T, K] int64 全局专家号
-    w13: [E, 2I, H]（前 I 行 gate、后 I 行 up）；w2: [E, H, I]（均为本 rank 专家内 TP 分片）
+    w13: [E, 2I, H]（前 I 行 gate、后 I 行 up）；w2: [E, H, I]（均为本 rank 专家内 TP 分片）。
+    bf16 或 W8 量化（int8 + w13_scale [E, 2I, H/G] / w2_scale [E, H, I/G]）。
     返回 [T, K, H]：本 rank 本地专家贡献，非本地 (token, slot) 位置为 0。
     """
+    quant = w13.dtype == torch.int8
+    assert (not quant) or (w13_scale is not None and w2_scale is not None), \
+        "W8 量化 MoE 权重必须同时传入 scales（w13_scale / w2_scale）"
     T, H = x.shape
     K = topk_ids.shape[1]
     E, I = w13.shape[0], w2.shape[2]
@@ -171,16 +170,18 @@ def fused_moe_triton(
 
     c1 = torch.empty((m_max, 2 * I), device=device, dtype=x.dtype)
     _moe_grouped_gemm[(m_max // _BM, (2 * I) // _BN)](
-        x, w13, c1, sorted_ids, expert_ids, N,
+        x, w13, c1, w13_scale if quant else w13, sorted_ids, expert_ids, N,
         K_TOPK=K, N_OUT=2 * I, K_IN=H, BM=_BM, BN=_BN, BK=_BK, A_BY_TOKEN=True,
+        QUANT_W=quant, GROUP=WEIGHT_GROUP,
         num_warps=4, num_stages=3,
     )
     gate, up = c1.chunk(2, dim=1)
     h = F.silu(gate) * up  # [M_max, I]
     y = torch.empty((m_max, H), device=device, dtype=x.dtype)
     _moe_grouped_gemm[(m_max // _BM, H // _BN)](
-        h, w2, y, sorted_ids, expert_ids, N,
+        h, w2, y, w2_scale if quant else w2, sorted_ids, expert_ids, N,
         K_TOPK=K, N_OUT=H, K_IN=I, BM=_BM, BN=_BN, BK=_BK, A_BY_TOKEN=False,
+        QUANT_W=quant, GROUP=WEIGHT_GROUP,
         num_warps=4, num_stages=3,
     )
     pair_valid = sorted_ids < N
@@ -201,12 +202,20 @@ def fused_moe_bmm(
     local_start: int,
     w13: torch.Tensor,
     w2: torch.Tensor,
+    w13_scale: torch.Tensor | None = None,
+    w2_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """纯 torch padded bmm 融合路径（CPU / 无 Triton 兜底），输出布局同 fused_moe_triton。
 
     每个专家 padding 到 R=T*K 行：pair id 直接作行号，未路由到该专家的输入行全 0，
     bmm 输出严格为 0，scatter 时只写真实 (token, slot)，不破坏其他专家贡献。
+    W8 量化权重先物化反量化（此路径仅用于 CPU 单测 / 调试）。
     """
+    if w13.dtype == torch.int8:
+        assert w13_scale is not None and w2_scale is not None, \
+            "W8 量化 MoE 权重必须同时传入 scales（w13_scale / w2_scale）"
+        w13 = dequantize_weight(w13, w13_scale, WEIGHT_GROUP)
+        w2 = dequantize_weight(w2, w2_scale, WEIGHT_GROUP)
     T, H = x.shape
     K = topk_ids.shape[1]
     E, I = w13.shape[0], w2.shape[2]

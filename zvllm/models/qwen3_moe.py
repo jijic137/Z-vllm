@@ -17,6 +17,7 @@ class Qwen3MoeExpert(nn.Module):
         hidden_size: int,
         moe_intermediate_size: int,
         tp_group: "dist.ProcessGroup | None",
+        quantized: bool = False,
     ) -> None:
         super().__init__()
         # 单个专家：与 dense MLP 同构，但 linear 按"专家内 TP"组切分
@@ -25,12 +26,14 @@ class Qwen3MoeExpert(nn.Module):
             [moe_intermediate_size] * 2,
             bias=False,
             tp_group=tp_group,
+            quantized=quantized,
         )
         self.down_proj = RowParallelLinear(
             moe_intermediate_size,
             hidden_size,
             bias=False,
             tp_group=tp_group,
+            quantized=quantized,
         )
         self.act_fn = SiluAndMul()
 
@@ -57,6 +60,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         moe_tp_size: int,
         moe_ep_size: int,
         tp_group: "dist.ProcessGroup | None",
+        quantized: bool = False,
     ) -> None:
         super().__init__()
         self.num_experts = config.num_experts
@@ -70,7 +74,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.local_expert_ids = list(range(ep_rank * num_local, (ep_rank + 1) * num_local))
         # ModuleDict 保留全局专家号进参数名（mlp.experts.{e}.*），与 checkpoint 命名对齐
         self.experts = nn.ModuleDict({
-            str(e): Qwen3MoeExpert(config.hidden_size, config.moe_intermediate_size, tp_group)
+            str(e): Qwen3MoeExpert(config.hidden_size, config.moe_intermediate_size, tp_group,
+                                   quantized=quantized)
             for e in self.local_expert_ids
         })
         # router 全量复制在每个 rank：输入跨 rank 一致，top-k 结果天然一致，无需通信
@@ -87,10 +92,25 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         num_local = len(self.local_expert_ids)
         self.w13 = torch.empty(num_local, *gw.shape, dtype=gw.dtype, device=gw.device)
         self.w2 = torch.empty(num_local, *dw.shape, dtype=dw.dtype, device=dw.device)
+        if quantized:
+            # W8：scale 大 buffer 与权重 buffer 走同样的 view 重指向机制，
+            # loader 经 expert 参数 view 把量化结果写进大 buffer
+            gs, ds = first.gate_up_proj.weight_scale, first.down_proj.weight_scale
+            self.w13_scale = torch.empty(num_local, *gs.shape, dtype=gs.dtype, device=gs.device)
+            self.w2_scale = torch.empty(num_local, *ds.shape, dtype=ds.dtype, device=ds.device)
+        else:
+            self.w13_scale = self.w2_scale = None
+        if quantized and torch.cuda.is_available() and not triton_available():
+            # 量化 MoE 生产路径必须 kernel 内反量化（bmm 整层物化会让专家权重
+            # 显存翻倍）；GPU 上无可用 Triton 的量化模型启动即报错
+            raise RuntimeError("W8 量化 MoE 需要可用 Triton（当前 CUDA 环境无）")
         for i, e in enumerate(self.local_expert_ids):
             expert = self.experts[str(e)]
             expert.gate_up_proj.weight.data = self.w13[i]
             expert.down_proj.weight.data = self.w2[i]
+            if quantized:
+                expert.gate_up_proj.weight_scale.data = self.w13_scale[i]
+                expert.down_proj.weight_scale.data = self.w2_scale[i]
 
     def _forward_loop(self, x: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor) -> torch.Tensor:
         """遍历式实现：每专家一个 gather + GEMM + scatter 累加（含 host 同步，大批次 GEMM 足够大时无所谓）"""
@@ -117,7 +137,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         if use_triton or use_bmm:
             w13, w2 = self.w13, self.w2
             out = (fused_moe_triton if use_triton else fused_moe_bmm)(
-                x, topk_weights, topk_ids, self.local_start, w13, w2
+                x, topk_weights, topk_ids, self.local_start, w13, w2,
+                self.w13_scale, self.w2_scale
             )
         else:
             out = self._forward_loop(x, topk_weights, topk_ids)
@@ -137,6 +158,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         moe_tp_size: int,
         moe_ep_size: int,
         tp_group: "dist.ProcessGroup | None",
+        quantized: bool = False,
     ) -> None:
         super().__init__()
         self.self_attn = Qwen3Attention(
@@ -149,6 +171,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             head_dim=getattr(config, "head_dim", None),
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
+            quantized=quantized,
         )
         if layer_id < getattr(config, "first_k_dense_replace", 0):
             # 前 first_k_dense_replace 层是 dense MLP（HF Qwen3MoeConfig 缺省为 0，
@@ -157,9 +180,11 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
+                quantized=quantized,
             )
         else:
-            self.mlp = Qwen3MoeSparseMoeBlock(config, moe_tp_size, moe_ep_size, tp_group)
+            self.mlp = Qwen3MoeSparseMoeBlock(config, moe_tp_size, moe_ep_size, tp_group,
+                                               quantized=quantized)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -187,11 +212,12 @@ class Qwen3MoeModel(nn.Module):
         moe_tp_size: int,
         moe_ep_size: int,
         tp_group: "dist.ProcessGroup | None",
+        quantized: bool = False,
     ) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([
-            Qwen3MoeDecoderLayer(config, i, moe_tp_size, moe_ep_size, tp_group)
+            Qwen3MoeDecoderLayer(config, i, moe_tp_size, moe_ep_size, tp_group, quantized)
             for i in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -225,11 +251,12 @@ class Qwen3MoeForCausalLM(nn.Module):
         moe_tp_size: int,
         moe_ep_size: int,
         tp_group: "dist.ProcessGroup | None",
+        quantized: bool = False,
     ) -> None:
         super().__init__()
         # EP > 1 时 checkpoint 里有不属于本 rank 的专家权重，loader 需要跳过
         self.skip_unowned_weights = moe_ep_size > 1
-        self.model = Qwen3MoeModel(config, moe_tp_size, moe_ep_size, tp_group)
+        self.model = Qwen3MoeModel(config, moe_tp_size, moe_ep_size, tp_group, quantized)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data

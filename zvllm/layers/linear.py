@@ -3,6 +3,8 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
+from zvllm.quantization import WEIGHT_GROUP, quant_linear, quantize_weight
+
 
 def divide(numerator, denominator):
     assert denominator > 0, f"denominator must be positive, got {denominator}"
@@ -33,19 +35,44 @@ class LinearBase(nn.Module):
         bias: bool = False,
         tp_dim: int | None = None,
         tp_group: "dist.ProcessGroup | None" = None,
+        quantized: bool = False,
     ):
         super().__init__()
         self.tp_dim = tp_dim
         # tp_group 为 None 表示全局 TP 组（attention 等）；MoE 专家传入专家内 TP 子组
         self.tp_group = tp_group
         self.tp_rank, self.tp_size = _tp_rank_size(tp_group)
-        self.weight = nn.Parameter(torch.empty(output_size, input_size))
+        self.quantized = quantized
+        if quantized:
+            # W8：int8 packed 权重 + bf16 per-group scale（沿 in 维每 WEIGHT_GROUP 一个）。
+            # 参数名保持 weight（checkpoint 键映射依赖），dtype 区分存储形态。
+            assert input_size % WEIGHT_GROUP == 0, \
+                f"W8 量化要求 in 维（{input_size}）被组大小（{WEIGHT_GROUP}）整除"
+            self.weight = nn.Parameter(
+                torch.empty(output_size, input_size, dtype=torch.int8), requires_grad=False)
+            self.weight_scale = nn.Parameter(
+                torch.empty(output_size, input_size // WEIGHT_GROUP, dtype=torch.bfloat16),
+                requires_grad=False)
+        else:
+            self.weight = nn.Parameter(torch.empty(output_size, input_size))
+            self.weight_scale = None
         self.weight.weight_loader = self.weight_loader
         if bias:
             self.bias = nn.Parameter(torch.empty(output_size))
             self.bias.weight_loader = self.weight_loader
         else:
             self.register_parameter("bias", None)
+
+    def _load_quantized(self, w: torch.Tensor, s: torch.Tensor, shard: torch.Tensor) -> None:
+        """bf16 分片现场量化，写入给定权重/scale 区域（接受 narrowed view）。
+
+        分片必须先切好再量化：group 沿 in 维，Column 类只切 out 维（组完整），
+        Row 类切 in 维需满足整组对齐（见 RowParallelLinear 的断言），两种情况下
+        本地分片的 per-group 量化与全局量化结果逐位一致。QKV / MergedColumn
+        每次只加载一个子区域，必须传 narrowed view 只写该区域。"""
+        q, sc = quantize_weight(shard)
+        w.copy_(q)
+        s.copy_(sc)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
@@ -58,13 +85,22 @@ class ReplicatedLinear(LinearBase):
         input_size: int,
         output_size: int,
         bias: bool = False,
+        quantized: bool = False,
     ):
-        super().__init__(input_size, output_size, bias)
+        super().__init__(input_size, output_size, bias, quantized=quantized)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-        param.data.copy_(loaded_weight)
+        if self.quantized:
+            self._load_quantized(param.data, self.weight_scale.data, loaded_weight)
+        else:
+            param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.quantized:
+            y = quant_linear(x, self.weight, self.weight_scale)
+            if self.bias is not None:
+                y = y + self.bias
+            return y
         return F.linear(x, self.weight, self.bias)
 
 
@@ -76,18 +112,27 @@ class ColumnParallelLinear(LinearBase):
         output_size: int,
         bias: bool = False,
         tp_group: "dist.ProcessGroup | None" = None,
+        quantized: bool = False,
     ):
         world_size = _tp_rank_size(tp_group)[1]
-        super().__init__(input_size, divide(output_size, world_size), bias, 0, tp_group)
+        super().__init__(input_size, divide(output_size, world_size), bias, 0, tp_group, quantized)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
         shard_size = param_data.size(self.tp_dim)
         start_idx = self.tp_rank * shard_size
-        loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
-        param_data.copy_(loaded_weight)
+        shard = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
+        if self.quantized:
+            self._load_quantized(param.data, self.weight_scale.data, shard)
+        else:
+            param_data.copy_(shard)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.quantized:
+            y = quant_linear(x, self.weight, self.weight_scale)
+            if self.bias is not None:
+                y = y + self.bias
+            return y
         return F.linear(x, self.weight, self.bias)
 
 
@@ -99,17 +144,24 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         output_sizes: list[int],
         bias: bool = False,
         tp_group: "dist.ProcessGroup | None" = None,
+        quantized: bool = False,
     ):
         self.output_sizes = output_sizes
-        super().__init__(input_size, sum(output_sizes), bias, tp_group)
+        super().__init__(input_size, sum(output_sizes), bias, tp_group, quantized)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int):
         param_data = param.data
         shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
         shard_size = self.output_sizes[loaded_shard_id] // self.tp_size
         param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
-        loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
-        param_data.copy_(loaded_weight)
+        shard = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
+        if self.quantized:
+            self._load_quantized(
+                param_data,
+                self.weight_scale.data.narrow(self.tp_dim, shard_offset, shard_size),
+                shard)
+        else:
+            param_data.copy_(shard)
 
 
 class QKVParallelLinear(ColumnParallelLinear):
@@ -122,6 +174,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         total_num_kv_heads: int | None = None,
         bias: bool = False,
         tp_group: "dist.ProcessGroup | None" = None,
+        quantized: bool = False,
     ):
         tp_size = _tp_rank_size(tp_group)[1]
         total_num_kv_heads = total_num_kv_heads or total_num_heads
@@ -137,10 +190,11 @@ class QKVParallelLinear(ColumnParallelLinear):
             self.num_kv_heads = 1
         output_size = (total_num_heads + 2 * total_num_kv_heads) * self.head_size
         if self.num_kv_heads * tp_size == total_num_kv_heads:
-            super().__init__(hidden_size, output_size, bias, tp_group)
+            super().__init__(hidden_size, output_size, bias, tp_group, quantized)
         else:
             # 复制模式下每 rank 宽度 != 总量/tp，直接按每 rank head 数初始化
-            LinearBase.__init__(self, hidden_size, (self.num_heads + 2 * self.num_kv_heads) * self.head_size, bias, 0, tp_group)
+            LinearBase.__init__(self, hidden_size, (self.num_heads + 2 * self.num_kv_heads) * self.head_size,
+                               bias, 0, tp_group, quantized)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str):
         param_data = param.data
@@ -163,7 +217,13 @@ class QKVParallelLinear(ColumnParallelLinear):
             first_q = self.tp_rank * self.num_heads
             kv_head = first_q // (self.total_num_heads // self.total_num_kv_heads)
             loaded_weight = loaded_weight.chunk(self.total_num_kv_heads, self.tp_dim)[kv_head]
-        param_data.copy_(loaded_weight)
+        if self.quantized:
+            self._load_quantized(
+                param_data,
+                self.weight_scale.data.narrow(self.tp_dim, shard_offset, shard_size),
+                loaded_weight)
+        else:
+            param_data.copy_(loaded_weight)
 
 
 class RowParallelLinear(LinearBase):
@@ -174,22 +234,39 @@ class RowParallelLinear(LinearBase):
         output_size: int,
         bias: bool = False,
         tp_group: "dist.ProcessGroup | None" = None,
+        quantized: bool = False,
     ):
         world_size = _tp_rank_size(tp_group)[1]
-        super().__init__(divide(input_size, world_size), output_size, bias, 1, tp_group)
+        if quantized:
+            # group 沿 in 维切、Row 也沿 in 维切：每 rank 必须持完整组，否则本地量化
+            # 与全局量化不一致。例：30B-A3B 专家 down proj（in=768=6 组）不允许
+            # moe_tp=4/8（6 不能被 4/8 整除）——启动即报错，不静默出错数。
+            assert input_size % (WEIGHT_GROUP * world_size) == 0, \
+                (f"W8 量化：RowParallel 的 in 维（{input_size}）必须被 "
+                 f"组大小（{WEIGHT_GROUP}）×TP（{world_size}）整除")
+        super().__init__(divide(input_size, world_size), output_size, bias, 1, tp_group, quantized)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
         if param_data.ndim == 1:
+            # bias：保持 bf16，不参与量化
             param_data.copy_(loaded_weight)
             return
         shard_size = param_data.size(self.tp_dim)
         start_idx = self.tp_rank * shard_size
-        loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
-        param_data.copy_(loaded_weight)
+        shard = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
+        if self.quantized:
+            self._load_quantized(param.data, self.weight_scale.data, shard)
+        else:
+            param_data.copy_(shard)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
+        if self.quantized:
+            y = quant_linear(x, self.weight, self.weight_scale)
+            if self.tp_rank == 0 and self.bias is not None:
+                y = y + self.bias
+        else:
+            y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1:
             dist.all_reduce(y, group=self.tp_group)
         return y
