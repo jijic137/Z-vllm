@@ -56,8 +56,19 @@ class ParallelLMHead(VocabParallelEmbedding):
     def forward(self, x: torch.Tensor):
         context = get_context()
         if context.is_prefill:
-            last_indices = context.cu_seqlens_q[1:] - 1
-            x = x[last_indices].contiguous()
+            cu = context.cu_seqlens_q
+            if context.spec_flags is not None:
+                # 投机验证步：带草稿的段保留整段行（接受-拒绝需要段内每个位置的
+                # logit），非草稿段仍只保留输出行（末行）。全部 GPU 算子构造，
+                # 无 host 同步（cu[-1].item() 在验证步的采样同步前完成）
+                seqlens = cu[1:] - cu[:-1]
+                starts = cu[:-1].repeat_interleave(seqlens)
+                row = torch.arange(cu[-1].item(), device=x.device)
+                keep = (row - starts) == (seqlens - 1).repeat_interleave(seqlens)
+                keep |= context.spec_flags.repeat_interleave(seqlens)
+                x = x[keep].contiguous()
+            else:
+                x = x[cu[1:] - 1].contiguous()
         logits = F.linear(x, self.weight)
         if self.tp_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None

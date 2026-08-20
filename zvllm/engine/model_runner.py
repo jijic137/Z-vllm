@@ -200,12 +200,18 @@ class ModelRunner:
                 slot_mapping.extend(range(slot_start, slot_end))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
+        # 投机验证步：LM head 需对带草稿序列保留整段 logit 行（接受-拒绝用）；
+        # 批内无草稿时传 None 走"仅末行"快速路径（host 判断，不引入 GPU 同步）
+        if any(seq.draft_tokens for seq in seqs):
+            spec_flags = torch.tensor([bool(seq.draft_tokens) for seq in seqs], dtype=torch.bool, pin_memory=True).cuda(non_blocking=True)
+        else:
+            spec_flags = None
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables, spec_flags)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -265,8 +271,10 @@ class ModelRunner:
     def _sample_all(self, seqs: list[Sequence], logits: torch.Tensor) -> list[list[int]]:
         """每条序列产出一个 token 列表（非投机恒为单元素）。
 
-        行布局：批内各序列按序占 seqlen_q 行 logit。非投机序列从本段末行
-        （emission 行）批量采样；投机序列对 γ+1 行做接受-拒绝（_accept_one）。"""
+        行布局（LM head 行过滤后）：每条非投机序列占 1 行（输出行），每条投机
+        序列占 γ+1 行（回喂段 [last_token, 草稿...] 的逐位置行，位置 L-1+i）。
+        与 ParallelLMHead.forward 的 spec_flags 行保留规则严格并行。
+        非投机序列从输出行批量采样；投机序列对 γ+1 行做接受-拒绝（_accept_one）。"""
         token_lists: list[list[int]] = [[] for _ in seqs]
         emit_idx: list[tuple[int, int]] = []
         spec_items: list[tuple[int, Sequence, int]] = []
@@ -276,8 +284,8 @@ class ModelRunner:
                 spec_items.append((i, seq, row))
                 row += len(seq.draft_tokens) + 1
             else:
-                emit_idx.append((i, row + seq.num_scheduled_tokens - 1))
-                row += seq.num_scheduled_tokens
+                emit_idx.append((i, row))
+                row += 1
         if emit_idx:
             emit_seqs = [seqs[i] for i, _ in emit_idx]
             emit_logits = logits[torch.tensor([r for _, r in emit_idx], device=logits.device)]
