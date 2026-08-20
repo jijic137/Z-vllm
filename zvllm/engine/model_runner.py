@@ -7,8 +7,7 @@ from multiprocessing.shared_memory import SharedMemory
 from zvllm.config import Config
 from zvllm.layers.attention import HAS_FLASH_ATTN
 from zvllm.engine.sequence import Sequence
-from zvllm.models.qwen3 import Qwen3ForCausalLM
-from zvllm.models.qwen3_moe import Qwen3MoeForCausalLM
+from zvllm.models import build_model
 from zvllm.layers.sampler import Sampler
 from zvllm.utils.context import set_context, get_context, reset_context
 from zvllm.utils.loader import load_model
@@ -43,14 +42,14 @@ class ModelRunner:
                 group = dist.new_group(ranks=list(range(g * config.moe_tp_size, (g + 1) * config.moe_tp_size)))
                 if group is not None:
                     self.moe_tp_group = group
-            self.model = Qwen3MoeForCausalLM(hf_config, config.moe_tp_size, config.moe_ep_size, self.moe_tp_group)
+            self.model = build_model(hf_config, config, self.moe_tp_group)
             if not self.enforce_eager:
                 # top-k 路由使每专家 GEMM 形状动态，与 CUDA Graph 固定形状捕获不兼容
                 self.enforce_eager = True
                 if self.rank == 0:
                     print("[Z-vLLM] 检测到 MoE 模型，自动切换到 enforce_eager=True（CUDA Graph 暂不支持）")
         else:
-            self.model = Qwen3ForCausalLM(hf_config)
+            self.model = build_model(hf_config, config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()

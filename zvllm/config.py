@@ -1,6 +1,8 @@
 import os
 from dataclasses import dataclass
 
+from zvllm.models import SUPPORTED_MODEL_TYPES
+
 
 @dataclass(slots=True)
 class Config:
@@ -35,6 +37,10 @@ class Config:
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)
+        # 早期校验模型家族，避免不支持的架构落到 worker 里才失败（或静默出错）
+        model_type = getattr(self.hf_config, "model_type", "")
+        assert model_type in SUPPORTED_MODEL_TYPES, \
+            f"不支持的 model_type: {model_type!r}（当前支持 {', '.join(SUPPORTED_MODEL_TYPES)}）"
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         if getattr(self.hf_config, "model_type", "") == "qwen3_moe":
             if self.moe_tp_size is None:
