@@ -4,9 +4,9 @@
 
 # Z-vLLM
 
-从零实现的轻量级 LLM 推理引擎，个人二次开发项目。
+基于开源项目二次开发实现的轻量级 LLM 推理引擎。
 
-约 1,900 行 Python 代码，完整实现现代 LLM 推理的核心机制：PagedAttention、continuous batching、prefix caching、chunked prefill、张量并行、专家并行（MoE）、CUDA graph、torch.compile。推理吞吐与 vLLM 相当（见 [Benchmark](#benchmark)）。
+完整实现现代 LLM 推理的核心机制：PagedAttention、continuous batching、prefix caching、chunked prefill、张量并行、专家并行（MoE）、CUDA graph、torch.compile。推理吞吐与 vLLM 相当（见 [Benchmark](#benchmark)）。
 
 ## 特性
 
