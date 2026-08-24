@@ -195,4 +195,15 @@ cython_debug/
 .cursorindexingignore
 
 # 本地维护文档（不上传仓库）
-项目功能与实现梳理.md
+阅读文档/
+
+# 调试产物（本地保留，不入库）
+bisect_warmup.py
+dbg_spec_pos.py
+dbg_spec_pos3.py
+dbg3_kv_profile.py
+old_engine_test.py
+spec.bundle
+spec_close.bundle
+spec_fix.bundle
+upload_kv.py
