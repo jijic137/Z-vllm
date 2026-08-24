@@ -36,7 +36,7 @@
 .
 ├── example.py                # 快速上手示例
 ├── example_qwen3_moe.py      # Qwen3-30B-A3B MoE 示例（TP / EP）
-├── bench.py                  # 吞吐基准测试脚本
+├── benchmarks/               # 性能基准脚本（bench*.py，见下）
 ├── tests/                    # 纯 CPU 单元测试（调度 / 块管理 / 流式 / API 服务）
 ├── assets/logo.png
 └── zvllm/
@@ -197,7 +197,7 @@ for event in llm.generate(["Hello, Z-vLLM."], sampling_params, stream=True):
 * `top_k`：只保留概率最高的 k 个 token，-1 不限制
 * `top_p`：nucleus 采样，保留累积概率首次达到 p 的最小前缀集
 * `seed`：给定后该序列的随机流可复现
-* `ignore_eos`：遇到 EOS 仍继续生成到 `max_tokens`（`bench.py` 中用于压测）
+* `ignore_eos`：遇到 EOS 仍继续生成到 `max_tokens`（`benchmarks/bench.py` 中用于压测）
 
 `llm.generate(prompts, sampling_params, use_tqdm=True, stream=False)`：`prompts` 支持 `str` 或 token id 列表；`sampling_params` 可为单个参数或逐请求列表。`stream=False` 按输入顺序返回完整结果（含 `"text"` / `"token_ids"` 字段）；`stream=True` 返回生成器，逐请求逐 token 产出事件（`"index"` / `"delta"` / `"text"` / `"token_ids"` / `"finished"` / `"finish_reason"`）。
 
@@ -247,9 +247,9 @@ ulp 级漂移翻转 tie-break 即产生分歧。prompts 1/2 即使用了草稿�
 
 口径：单序列 A/B 逐位一致为硬门槛（该栈 verify M=5 vs decode M=1 逐位相同，实测 3/3 绿）；多序列改用近 tie 容差门槛，避免把 bf16 固有数值行为误判为 bug。
 
-### 性能（bench_spec.py）
+### 性能（benchmarks/bench_spec.py）
 
-`bench_spec.py`：Qwen3-0.6B，1× W7900D（SDPA 兜底 + eager），贪心，8 并发 × 192 输出 token，
+`benchmarks/bench_spec.py`：Qwen3-0.6B，1× W7900D（SDPA 兜底 + eager），贪心，8 并发 × 192 输出 token，
 随机 token-id prompt（128–300 token），已排除 warmup：
 
 | 指标 | spec off | spec on | 加速比 |
@@ -292,7 +292,7 @@ client.generate(["..."])    # 与 LLMEngine 同构接口：add_request / generat
 * **容错**：per-replica 看门狗（step_timeout 无回话 → 全局 fail-fast：拒新请求 + 在途请求快速失败 + `on_fatal` 回调）；api_server 将 fatal 转为 HTTP 503 并拒绝新请求。
 * **与 vLLM 的形态差异**：vLLM 的 DP attention 是"同进程内 DP"（一个模型实例，attention DP rank 间共享调度、专家 EP rank 间 all-to-all 换 token）；本实现是"进程级多副本"（每副本完整独立引擎，请求粒度 round-robin 路由，副本间零通信）。形态更简单、隔离更强（单副本崩溃不拖垮全局，看门狗 + fail-fast 可控），代价是每副本独立持有权重与 KV：无跨副本 prefix 共享、无 token 粒度负载均衡。
 
-### 性能（bench_dp.py）
+### 性能（benchmarks/bench_dp.py）
 
 硬件与负载：4× W7900D 48GB（gfx1100，ROCm 7.1.1），Qwen3-30B-A3B（bf16），
 prompt 256 随机 token / 生成 128 token，N≥16，并发 C ∈ {1, 4, 16, 32, 64} 个 worker 线程，
@@ -388,7 +388,7 @@ print(resp.choices[0].message.content)
 
 ## Benchmark
 
-基准脚本见 `bench.py`。基线数据：
+基准脚本见 `benchmarks/bench.py`。基线数据：
 
 **测试配置**
 
@@ -433,7 +433,7 @@ print(resp.choices[0].message.content)
     融合路径零拷贝、零额外显存
   * 同一配置跨进程重复运行输出逐字节可复现；EP=2/4/8 输出文本一致
     （差异仅来自 bf16 求和顺序），均为连贯正确的英文输出
-  * 并发 decode 扫描（`bench_moe_conc.py`）：1/16/32/64 请求 × EP=2/4/8，
+  * 并发 decode 扫描（`benchmarks/bench_moe_conc.py`）：1/16/32/64 请求 × EP=2/4/8，
     聚合吞吐随 N 近线性（每翻倍 ≈1.93–1.99×），峰值 587.79 tok/s（EP=8，N=64）；
     T=1 平台期在高并发下被击穿，EP=8 反超（N=64 时 +10.8%）
 * **权重量化（W8A16）**：2026-08-20，`weight_bits=8`（加载时 int8，per-group 128 对称，kernel 内反量化；embed/lm_head 保持 bf16）
@@ -446,9 +446,9 @@ print(resp.choices[0].message.content)
   * CPU 单测：调度器级（草稿获取 / 验证步记账 / 块预留 / 接受回写 / 统计）+ 全链路仿真（真实模型 + 真实 ModelRunner，确定性目标函数下 spec on/off 必须逐位一致；覆盖 chunked prefill / 混合批 / 抢占 / prefix cache）；全套 93 项全绿
   * 贪心 A/B 门槛（`ab_spec_greedy.py`）：单序列 off/on 逐位一致（128 tokens）；3 序列：prompt 0 首个分歧 at 29，两侧决定行均为 4 路精确 bf16 tie（gap 0.0，min_gap ≤ 0.5 NEAR-TIE），分歧前无 argmax 早翻；prompts 1/2 逐位一致（含用草稿的情况）；on3b 跨进程重跑逐位一致 → ABG_PASS
   * 多序列分歧根因（B2 实验）：bf16 近 tie 固有数值行为而非 bug——off 批形状本身无漂移（M=3 vs M=1 逐位一致）、KV 漂移自首个草稿命中起（移动前沿，旧位置永久一致）、根因行 4 路精确 tie（gap 0.0）、97 个 argmax 分歧全部 ≥ 分歧点（级联）
-  * 性能（`bench_spec.py`，8 并发 × 192 tok 贪心，随机 token prompt）：TPOT mean 30.75 → 23.31 ms（1.32×）、median 18.38 ms（1.67×）；TTFT 不变（100.3 ms）；接受率 0.958（852/889，231 spec 步）；聚合吞吐 257.1 → 193.1 tok/s（0.75×，wall 5.97 → 7.95 s）——批内任一带草稿即全批 varlen、小模型 decode 步太短摊不平验证开销、最慢序列（≈41 ms/token）决定 wall，如实记录；收益区间在大模型 / 低并发单流（decode 步长）
+  * 性能（`benchmarks/bench_spec.py`，8 并发 × 192 tok 贪心，随机 token prompt）：TPOT mean 30.75 → 23.31 ms（1.32×）、median 18.38 ms（1.67×）；TTFT 不变（100.3 ms）；接受率 0.958（852/889，231 spec 步）；聚合吞吐 257.1 → 193.1 tok/s（0.75×，wall 5.97 → 7.95 s）——批内任一带草稿即全批 varlen、小模型 decode 步太短摊不平验证开销、最慢序列（≈41 ms/token）决定 wall，如实记录；收益区间在大模型 / 低并发单流（decode 步长）
 
-* **DP 多副本（DP 2×tp2×ep2）**：2026-08-20，4× W7900D（GPU 2–5）+ Qwen3-30B-A3B bf16，`bench_dp.py` 5 并发点扫描
+* **DP 多副本（DP 2×tp2×ep2）**：2026-08-20，4× W7900D（GPU 2–5）+ Qwen3-30B-A3B bf16，`benchmarks/bench_dp.py` 5 并发点扫描
   * C=64：吞吐 365.2 tok/s vs 单引擎 tp4×ep4 339.3（+7.6%），TPOT 143.3 vs 160.9 ms（−10.9%）；C≤32 单引擎占优
     （C=16 +16.1% / C=32 +11.1%），交叉点 C=32–64，机制分析见 [DP（多副本）推理](#dp多副本推理)
   * 实测发现并修复：daemon 副本无法 spawn TP rank 子进程（AssertionError）→ 改非 daemon + 父进程存活检查，
@@ -472,7 +472,7 @@ print(resp.choices[0].message.content)
     per-head / per-channel 更细 scale（见[KV cache 量化](#kv-cache-量化kv-int8)）
 
 性能数据（Qwen3-30B-A3B，W7900D，SDPA 兜底，单请求，prompt ≈ 10 token / 生成 64 token，贪心；
-MoE 数字来自 `bench_moe_ep.py`，best of 2 runs）：
+MoE 数字来自 `benchmarks/bench_moe_ep.py`，best of 2 runs）：
 
 | 并行模式 | 耗时 (s) | 吞吐 (tokens/s) |
 |---|---|---|
@@ -490,7 +490,7 @@ MoE 数字来自 `bench_moe_ep.py`，best of 2 runs）：
 > 与 [Benchmark](#benchmark) 的稠密模型多请求批处理数字不可直接对比。
 
 并发 decode 数据（同模型同硬件；N 路贪心并发，每流 prompt ≈ 10 token / 生成 64 token，
-来自 `bench_moe_conc.py`，best of 2 runs；decode 步延迟为稳态段中位数）：
+来自 `benchmarks/bench_moe_conc.py`，best of 2 runs；decode 步延迟为稳态段中位数）：
 
 | 并行模式 | 并发 N | decode 步延迟 (ms) | 聚合吞吐 (tokens/s) | 单流吞吐 (tokens/s) |
 |---|---|---|---|---|
