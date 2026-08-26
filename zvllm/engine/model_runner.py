@@ -143,6 +143,13 @@ class ModelRunner:
         else:
             block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+        if self.world_size > 1:
+            # 逻辑 KV block 空间必须在所有 TP rank 上一致（同一序列在各 rank 用相同的 block id，
+            # 各 rank 只持有自己那份 KV head 分片），而不同 rank 各自估算的容量可能不同；
+            # 取全 world 最小值，保证每个 rank 的物理 KV 池 >= 调度器共享的 BlockManager 池。
+            local = torch.tensor([config.num_kvcache_blocks], dtype=torch.int64, device="cuda")
+            dist.all_reduce(local, op=dist.ReduceOp.MIN)
+            config.num_kvcache_blocks = int(local.item())
         assert config.num_kvcache_blocks > 0
         cache_dtype = torch.int8 if kv_int8 else hf_config.dtype
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size,
