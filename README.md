@@ -38,6 +38,7 @@
 ├── example_qwen3_moe.py      # Qwen3-30B-A3B MoE 示例（TP / EP）
 ├── benchmarks/               # 性能基准脚本（bench*.py，见下）
 ├── tests/                    # 纯 CPU 单元测试（调度 / 块管理 / 流式 / API 服务）
+├── scripts/dev/              # 开发验证工具（冒烟 / HF 对拍 / 权重核对，见其中 README）
 ├── assets/logo.png
 └── zvllm/
     ├── __init__.py           # 对外 API：LLM、SamplingParams
