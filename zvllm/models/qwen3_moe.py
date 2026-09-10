@@ -10,6 +10,29 @@ from zvllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from zvllm.models.qwen3 import Qwen3Attention, Qwen3MLP
 
 
+def is_moe_layer(config, layer_id: int) -> bool:
+    """判定第 layer_id 层用稀疏 MoE 还是稠密 MLP（与 HF Qwen3MoeDecoderLayer 语义一致）。
+
+    HF 原式：
+        (layer_id not in config.mlp_only_layers) and (
+            config.num_experts > 0 and (layer_id + 1) % config.decoder_sparse_step == 0)
+    即 mlp_only_layers 里的层恒为稠密层；其余层按 decoder_sparse_step（每 N 层一个 MoE 层，
+    step=1 即全部）取模决定。Qwen3-30B-A3B / 235B-A22B 均为 mlp_only_layers=[] + step=1
+    （全层 MoE），而部分衍生 checkpoint（如 PrimeIntellect/qwen3-moe-tiny）用
+    mlp_only_layers=[0] 把第 0 层设成稠密层。
+
+    另外兼容 qwen2_moe 家族的 first_k_dense_replace（Qwen3-MoE config 不含该字段，
+    getattr 兜底为 0，因此对 Qwen3-MoE 无影响）。
+    """
+    if layer_id in (getattr(config, "mlp_only_layers", None) or []):
+        return False
+    if layer_id < (getattr(config, "first_k_dense_replace", 0) or 0):
+        return False
+    num_experts = getattr(config, "num_experts", 0) or 0
+    sparse_step = getattr(config, "decoder_sparse_step", 1) or 1
+    return num_experts > 0 and (layer_id + 1) % sparse_step == 0
+
+
 class Qwen3MoeExpert(nn.Module):
 
     def __init__(
@@ -173,18 +196,17 @@ class Qwen3MoeDecoderLayer(nn.Module):
             rope_scaling=getattr(config, "rope_scaling", None),
             quantized=quantized,
         )
-        if layer_id < getattr(config, "first_k_dense_replace", 0):
-            # 前 first_k_dense_replace 层是 dense MLP（HF Qwen3MoeConfig 缺省为 0，
-            # 如 Qwen3-30B-A3B 全 48 层 MoE；235B 等在 config.json 中显式置 1）
+        if is_moe_layer(config, layer_id):
+            self.mlp = Qwen3MoeSparseMoeBlock(config, moe_tp_size, moe_ep_size, tp_group,
+                                               quantized=quantized)
+        else:
+            # 稠密层用 config.intermediate_size（与 HF Qwen3MoeMLP 一致，注意不是 moe_intermediate_size）
             self.mlp = Qwen3MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quantized=quantized,
             )
-        else:
-            self.mlp = Qwen3MoeSparseMoeBlock(config, moe_tp_size, moe_ep_size, tp_group,
-                                               quantized=quantized)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
