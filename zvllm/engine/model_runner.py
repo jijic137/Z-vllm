@@ -14,6 +14,19 @@ from zvllm.utils.context import set_context, get_context, reset_context
 from zvllm.utils.loader import load_model
 
 
+def cudagraph_batch_sizes(max_num_seqs: int, max_graph_bs: int) -> list[int]:
+    """CUDA Graph 需要捕获的 batch size 列表（必须覆盖 1..max_bs 的每个取值）。
+
+    decode 步按"最小的不小于实际 batch 的已捕获图"选择 replay，因此列表里任何
+    一段空档都会让落在其中的 batch 查找失败。只取 16 的整数倍会漏掉最后一段残批：
+    max_bs=100 时列表止于 96，bs=97..100 直接 StopIteration（max_num_seqs=100 或
+    max_graph_bs=20 这类非 16 倍数配置即可触发，2026-09-10 定位）。故末尾补上 max_bs。
+    """
+    max_bs = min(max_num_seqs, max_graph_bs)
+    small = {s for s in (1, 2, 4, 8) if s <= max_bs}    # max_num_seqs 很小时不捕获用不到的图
+    return sorted(small | {*range(16, max_bs + 1, 16), max_bs})
+
+
 class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
@@ -267,7 +280,12 @@ class ModelRunner:
         else:
             bs = input_ids.size(0)
             context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+            graph_bs = next((x for x in self.graph_bs if x >= bs), None)
+            if graph_bs is None:
+                # 超出已捕获的最大 batch：退回 eager 而不是中断服务
+                # （cudagraph_batch_sizes 已保证覆盖到 max_bs，这里是纯防御）
+                return self.model.compute_logits(self.model(input_ids, positions))
+            graph = self.graphs[graph_bs]
             graph_vars = self.graph_vars
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
@@ -333,7 +351,7 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        self.graph_bs = cudagraph_batch_sizes(config.max_num_seqs, config.max_graph_bs)
         self.graphs = {}
         self.graph_pool = None
 
