@@ -51,6 +51,16 @@ python scripts/dev/compare_hf.py Qwen/Qwen3-0.6B --max-tokens 24 --gpu-mem 0.6
 python scripts/dev/inspect_ckpt.py PrimeIntellect/qwen3-moe-tiny model.layers.0.
 ```
 
+**`probe_teardown.py`** — 探针：引擎销毁后显存是否真的释放，以及同进程内能否连续建引擎。
+`llm_engine` 的清理逻辑（`atexit` vs `weakref.finalize`、`exit()` 幂等）改动后必跑。
+
+```bash
+python scripts/dev/probe_teardown.py PrimeIntellect/qwen3-moe-tiny --mode refs        # 谁还持有引擎对象
+python scripts/dev/probe_teardown.py PrimeIntellect/qwen3-moe-tiny --mode del         # del 后应降到 ~0.02 GiB
+python scripts/dev/probe_teardown.py PrimeIntellect/qwen3-moe-tiny --mode exit
+python scripts/dev/probe_teardown.py PrimeIntellect/qwen3-moe-tiny --mode sequential  # 连续建两个引擎
+```
+
 ## 两个环境坑
 
 `torch.compile` / inductor 在 2080 Ti（sm_75，11GB）上会开多个 compile worker 吃满显存且长时间不返回。

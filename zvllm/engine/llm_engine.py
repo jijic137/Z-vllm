@@ -1,4 +1,4 @@
-import atexit
+import weakref
 from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
@@ -9,6 +9,13 @@ from zvllm.config import Config
 from zvllm.sampling_params import SamplingParams, find_stop_match
 from zvllm.engine.sequence import Sequence
 from zvllm.engine.scheduler import Scheduler
+
+
+def _teardown_engine(model_runner, ps):
+    """引擎对象被回收（或解释器退出）时的兜底清理，等价于显式调用 exit()。"""
+    model_runner.call("exit")
+    for p in ps:
+        p.join()
 
 
 class LLMEngine:
@@ -35,13 +42,20 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
-        atexit.register(self.exit)
+        # 用 weakref.finalize 而不是 atexit.register(self.exit)：绑定方法会被 atexit
+        # 注册表强引用（self.exit -> self -> model_runner -> KV cache / 权重），于是
+        # `del llm` 一个字节都释放不掉——实测 del + gc.collect + empty_cache 后仍占
+        # 3.57 GiB，同进程内再建一个引擎直接超卖显存（2026-09-10 定位）。
+        # finalize 不持 self 的强引用，因而对象被回收时可立即释放显存，同时在解释器
+        # 退出时仍会兜底触发（finalize 内部自带的 atexit 钩子）。
+        self._finalizer = weakref.finalize(self, _teardown_engine, self.model_runner, self.ps)
 
     def exit(self):
-        runner = getattr(self, "model_runner", None)
-        if runner is None:
-            return    # 已退出（幂等：显式 exit 与 atexit 会各调一次）
-        runner.call("exit")
+        # detach 先释放 finalize 持有的 model_runner 引用，否则下面的 del 之后
+        # 显存仍被 finalizer 的参数钉住；返回值非 None 表示本次是首次退出（幂等）
+        if self._finalizer.detach() is None:
+            return
+        self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:
             p.join()
