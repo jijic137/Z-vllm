@@ -234,6 +234,11 @@ class DPClient:
             for t in self._readers:
                 t.start()
             self._watchdog.start()
+            # 这里用的是 atexit.register(self.close)（绑定方法强引用 self），但 DPClient
+            # 本来就被自己的 driver/reader/watchdog 线程钉住——线程目标 self.*_loop 是绑定
+            # 方法，线程对象又挂在 threading._active 上（2026-09-10 用 gc.get_referrers 实测
+            # 确认），所以换成 weakref.finalize 并不会让"丢弃即回收"成立，退出时兜底语义也
+            # 完全一致。结论：DPClient 必须显式 close()，别指望 GC 替它停副本。
             atexit.register(self.close)
 
     def _make_queues(self):
